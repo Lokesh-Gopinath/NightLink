@@ -178,23 +178,39 @@ async fn execute_input(line: &str, current_mode: &mut TransportMode) -> anyhow::
             let config = config::load()?;
             let addr = format!("0.0.0.0:{}", config.listen_port);
             println!("[nite] Listening on {} via {}", addr, current_mode);
-            let listener = p2p::listen(&addr).await?;
             println!("[nite] Press Ctrl+C to stop serving");
-            match listener.accept().await {
-                Ok((stream, peer_addr)) => {
-                    println!("[nite] Incoming connection from {}", peer_addr);
-                    handle_incoming(stream).await?;
+            let listener = p2p::listen(&addr).await?;
+
+            // Accept one connection, or return on Ctrl+C
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer_addr)) => {
+                            println!("[nite] Incoming connection from {}", peer_addr);
+                            handle_incoming(stream).await?;
+                        }
+                        Err(e) => eprintln!("[nite] Accept error: {}", e),
+                    }
                 }
-                Err(e) => eprintln!("[nite] Accept error: {}", e),
+                _ = tokio::signal::ctrl_c() => {
+                    println!("[nite] Stopped serving.");
+                }
             }
             Ok(true)
         }
         "chat" => {
             if parts.len() > 1 {
                 let peer = parts[1..].join(" ");
-                let (nl_id, addr) = config::resolve_contact(&peer, *current_mode)?;
+                let (nl_id, addr) = config::resolve_contact(&peer, *current_mode)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                if addr == peer && !peer.contains('.') && !peer.contains(':') && !peer.ends_with(".onion") {
+                    println!("[nite] Unknown contact '{}'. Add it first with 'contact add' or use a direct address.", peer);
+                    return Ok(true);
+                }
                 println!("[nite] Starting chat with {} ({})", nl_id, addr);
-                chat::start(&addr, *current_mode).await?;
+                if let Err(e) = chat::start(&addr, *current_mode).await {
+                    eprintln!("[nite] Chat failed: {}", e);
+                }
             } else {
                 println!("[nite] Usage: chat <address|alias>");
             }
@@ -203,9 +219,16 @@ async fn execute_input(line: &str, current_mode: &mut TransportMode) -> anyhow::
         "call" => {
             if parts.len() > 1 {
                 let peer = parts[1..].join(" ");
-                let (nl_id, addr) = config::resolve_contact(&peer, *current_mode)?;
+                let (nl_id, addr) = config::resolve_contact(&peer, *current_mode)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                if addr == peer && !peer.contains('.') && !peer.contains(':') && !peer.ends_with(".onion") {
+                    println!("[nite] Unknown contact '{}'. Add it first with 'contact add' or use a direct address.", peer);
+                    return Ok(true);
+                }
                 println!("[nite] Starting call with {} ({})", nl_id, addr);
-                voice::start_call(&addr, *current_mode).await?;
+                if let Err(e) = voice::start_call(&addr, *current_mode).await {
+                    eprintln!("[nite] Call failed: {}", e);
+                }
             } else {
                 println!("[nite] Usage: call <address|alias>");
             }
@@ -301,21 +324,32 @@ async fn main() -> anyhow::Result<()> {
         loop {
             // Show prompt: ":NightLink:" in bold
             let prompt = format!("{} ", bold(":NightLink:"));
-            
-            // Read a line of input
-            let mut input = String::new();
             print!("{}", prompt);
             use std::io::Write;
-            std::io::stdout().flush()?;
-            std::io::stdin().read_line(&mut input)?;
+            std::io::stdout().flush().ok();
 
-            let input = input.trim().to_string();
-            if input.is_empty() {
-                continue;
-            }
+            // Read input with Ctrl+C protection
+            let mut input = String::new();
+            let read_result = std::io::stdin().read_line(&mut input);
 
-            if !execute_input(&input, &mut transport).await? {
-                break;
+            match read_result {
+                Ok(0) | Err(_) => {
+                    // EOF or Ctrl+C (stdin returns error on Ctrl+C on Windows)
+                    println!();
+                    println!("[nite] Goodbye.");
+                    break;
+                }
+                Ok(_) => {
+                    let input = input.trim().to_string();
+                    if input.is_empty() {
+                        continue;
+                    }
+                    match execute_input(&input, &mut transport).await {
+                        Ok(false) => break,
+                        Ok(true) => {}
+                        Err(e) => eprintln!("[nite] Error: {}", e),
+                    }
+                }
             }
         }
 
@@ -357,18 +391,27 @@ async fn main() -> anyhow::Result<()> {
                 let config = config::load()?;
                 let addr = format!("0.0.0.0:{}", config.listen_port);
                 println!("[nite] Listening on {} via {}", addr, transport);
+                println!("[nite] Press Ctrl+C to stop serving");
                 let listener = p2p::listen(&addr).await?;
                 loop {
-                    match listener.accept().await {
-                        Ok((stream, peer_addr)) => {
-                            println!("[nite] Incoming connection from {}", peer_addr);
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_incoming(stream).await {
-                                    eprintln!("[nite] Connection handler error: {}", e);
+                    tokio::select! {
+                        result = listener.accept() => {
+                            match result {
+                                Ok((stream, peer_addr)) => {
+                                    println!("[nite] Incoming connection from {}", peer_addr);
+                                    tokio::spawn(async move {
+                                        if let Err(e) = handle_incoming(stream).await {
+                                            eprintln!("[nite] Connection handler error: {}", e);
+                                        }
+                                    });
                                 }
-                            });
+                                Err(e) => eprintln!("[nite] Accept error: {}", e),
+                            }
                         }
-                        Err(e) => eprintln!("[nite] Accept error: {}", e),
+                        _ = tokio::signal::ctrl_c() => {
+                            println!("[nite] Stopped serving.");
+                            break;
+                        }
                     }
                 }
             }

@@ -31,7 +31,7 @@ Voice requires the Opus C library:
 - **Linux**: `apt install libopus-dev`
 - **macOS**: `brew install opus`
 
-Then build with voice support (included by default):
+Then build with voice support:
 
 ```bash
 cargo build --release --features voice
