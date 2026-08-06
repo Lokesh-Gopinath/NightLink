@@ -1,73 +1,121 @@
-//! Text chat implementation for nite
+use crate::types::{Config, NLID};
+use crate::crypto;
+use crate::tor;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use anyhow::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use std::io::{self, BufRead};
 
-use crate::types::TransportMode;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
-
-pub async fn start(peer_addr: &str, transport: TransportMode) -> anyhow::Result<()> {
-    println!("[nite] Connecting to {} via {}...", peer_addr, transport);
-
-    let mut stream = crate::p2p::connect(peer_addr, transport).await?;
-    println!("[nite] Connected to {}", peer_addr);
-    println!("[nite] Type your messages below. Press Ctrl+C or type /quit to exit.");
-
-    let config = crate::config::load()?;
-    println!("[nite] Exchanging encryption keys...");
-    let peer_public_key = crate::p2p::exchange_public_keys(&mut stream, &config.public_key).await?;
-
-    let passphrase = rpassword::prompt_password("[nite] Enter passphrase to decrypt private key: ")?;
-    let private_key = crate::crypto::decrypt_private_key(
-        &config.private_key_encrypted, &passphrase, &config.salt, &config.nonce,
-    )?;
-    let shared_secret = crate::crypto::derive_shared_secret(&private_key, &peer_public_key)?;
-    println!("[nite] Secure channel established (AES-256-GCM)");
-
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
-    let (mut read_half, mut write_half) = stream.into_split();
-
-    let display_task = tokio::spawn(async move {
-        loop {
-            match crate::p2p::receive_message_read(&mut read_half).await {
-                Ok(data) => match crate::crypto::decrypt_message(&data, &shared_secret) {
-                    Ok(plaintext) => match String::from_utf8(plaintext) {
-                        Ok(msg) => println!("[remote] {}", msg),
-                        Err(_) => println!("[nite] Received invalid UTF-8 message"),
-                    },
-                    Err(e) => println!("[nite] Decryption error: {}", e),
-                },
-                Err(e) => { println!("[nite] Connection lost: {}", e); break; }
+pub async fn start_chat(config: &Config, state: &Arc<Mutex<crate::types::AppState>>, target: &str) -> Result<(), Error> {
+    let (nl_id, tor_address) = match config.contacts.get(target) {
+        Some(contact) => (contact.alias.clone(), contact.tor_address.clone()),
+        None if target.starts_with("NL-") => {
+            if let Some(contact) = config.contacts.values().find(|c| c.alias == target) {
+                (contact.alias.clone(), contact.tor_address.clone())
+            } else {
+                return Err(anyhow::anyhow!("Unknown contact or NL-ID: {}", target));
             }
         }
-    });
+        _ => return Err(anyhow::anyhow!("Unknown contact or NL-ID: {}", target)),
+    };
 
-    let tx_clone = tx.clone();
-    let stdin_task = tokio::spawn(async move {
-        let stdin = tokio::io::stdin();
-        let reader = BufReader::new(stdin);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let line = line.trim().to_string();
-            if line.is_empty() { continue; }
-            if line == "/quit" { break; }
-            match crate::crypto::encrypt_message(line.as_bytes(), &shared_secret) {
-                Ok(encrypted) => {
-                    if tx_clone.blocking_send(encrypted).is_err() { break; }
-                    println!("[local] {}", line);
-                }
-                Err(e) => println!("[nite] Encryption error: {}", e),
-            }
-        }
-    });
+    let mut stream = tor::connect_via_tor(&tor_address).await?;
+    tor::send_nl_id(&mut stream, &config.nl_id).await?;
 
-    while let Some(encrypted) = rx.recv().await {
-        if let Err(e) = crate::p2p::send_message_write(&mut write_half, &encrypted).await {
-            println!("[nite] Failed to send message: {}", e);
-            break;
-        }
+    let peer_nl_id = tor::read_nl_id_from_stream(&mut stream).await?;
+    if peer_nl_id != nl_id && peer_nl_id != target {
+        return Err(anyhow::anyhow!("NL-ID mismatch! Expected {}, got {}", nl_id, peer_nl_id));
     }
 
-    stdin_task.abort();
-    display_task.abort();
-    println!("[nite] Chat ended.");
+    let (reader, mut writer) = tokio::io::split(stream);
+    let peer_alias = nl_id.clone();
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(reader);
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => break,
+            };
+            let msg = String::from_utf8_lossy(&buf[..n]);
+            println!("[{}]: {}", peer_alias, msg);
+        }
+    });
+
+    let mut stdin = io::BufReader::new(io::stdin());
+    let mut line = String::new();
+    loop {
+        print!("> ");
+        io::Write::flush(&mut io::stdout())?;
+        line.clear();
+        stdin.read_line(&mut line)?;
+        if line.trim() == "/quit" {
+            break;
+        }
+        writer.write_all(line.as_bytes()).await?;
+        writer.flush().await?;
+    }
     Ok(())
+}
+
+pub async fn handle_connection(
+    mut stream: tokio::net::TcpStream,
+    my_nl_id: NLID,
+    peer_alias: String,
+) -> Result<(), Error> {
+    tor::send_nl_id(&mut stream, &my_nl_id).await?;
+    let peer_nl_id = tor::read_nl_id_from_stream(&mut stream).await?;
+
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(reader);
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => break,
+            };
+            let msg = String::from_utf8_lossy(&buf[..n]);
+            println!("[{}]: {}", peer_alias, msg);
+        }
+    });
+
+    let mut stdin = io::BufReader::new(io::stdin());
+    let mut line = String::new();
+    loop {
+        print!("> ");
+        io::Write::flush(&mut io::stdout())?;
+        line.clear();
+        stdin.read_line(&mut line)?;
+        if line.trim() == "/quit" {
+            break;
+        }
+        writer.write_all(line.as_bytes()).await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+pub async fn prepare_incoming(stream: tokio::net::TcpStream, config: &Config) -> Result<IncomingConnection, Error> {
+    let mut stream = stream;
+    let _peer_nl_id = tor::read_nl_id_from_stream(&mut stream).await?;
+    
+    let shared_secret_vec = crypto::derive_session_key(&config.private_key_encrypted, &config.public_key);
+    let mut shared_secret = [0u8; 32];
+    shared_secret.copy_from_slice(&shared_secret_vec);
+    
+    Ok(IncomingConnection {
+        peer_nl_id: _peer_nl_id,
+        shared_secret,
+        stream,
+    })
+}
+
+pub struct IncomingConnection {
+    pub peer_nl_id: String,
+    pub shared_secret: [u8; 32],
+    pub stream: tokio::net::TcpStream,
 }
