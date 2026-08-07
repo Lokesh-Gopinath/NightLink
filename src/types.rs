@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub type NLID = String;
 pub type Error = anyhow::Error;
 
+use crate::theme::Theme;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub nl_id: NLID,
@@ -14,6 +16,7 @@ pub struct Config {
     pub public_key: Vec<u8>,
     pub tor_address: Option<String>,
     pub contacts: HashMap<NLID, Contact>,
+    pub theme: Theme,  // NEW: Theme support
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

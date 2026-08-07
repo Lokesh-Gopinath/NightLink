@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 mod types;
 mod config;
 mod crypto;
+mod theme;
 mod tor;
 mod chat;
 
@@ -21,21 +22,6 @@ fn clear_terminal() {
     {
         let _ = Command::new("clear").status();
     }
-}
-
-/// Show NIGHTLINK ASCII art
-fn show_logo() {
-    println!(
-        r#"
-███╗   ██╗    ██╗     ██████╗     ██╗  ██╗    ████████╗    ██╗         ██╗    ███╗   ██╗    ██╗  ██╗
-████╗  ██║    ██║    ██╔════╝     ██║  ██║    ╚══██╔══╝    ██║         ██║    ████╗  ██║    ██║ ██╔╝
-██╔██╗ ██║    ██║    ██║  ███╗    ███████║       ██║       ██║         ██║    ██╔██╗ ██║    █████╔╝ 
-██║╚██╗██║    ██║    ██║   ██║    ██╔══██║       ██║       ██║         ██║    ██║╚██╗██║    ██╔═██╗ 
-██║ ╚████║    ██║    ╚██████╔╝    ██║  ██║       ██║       ███████╗    ██║    ██║ ╚████║    ██║  ██╗
-╚═╝  ╚═══╝    ╚═╝     ╚═════╝     ╚═╝  ╚═╝       ╚═╝       ╚══════╝    ╚═╝    ╚═╝  ╚═══╝    ╚═╝  ╚═╝
-                                                                                                    
-"#
-    );
 }
 
 /// Pause and exit
@@ -86,6 +72,7 @@ enum Commands {
     Pending,
     Accept { alias: String },
     Reject { alias: String },
+    Theme { name: String },
     Help,
     Exit,
 }
@@ -127,8 +114,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ===== PHASE 3: Clear + Show UI =====
     clear_terminal();
-    show_logo();
-
+    
     // ===== PHASE 4: Load/Init Config + Save Onion Address =====
     let mut config = match load_or_init_config() {
         Ok(c) => c,
@@ -139,6 +125,10 @@ async fn main() -> anyhow::Result<()> {
     };
     config.tor_address = Some(format!("{}.onion:4444", onion_addr));
     config::save(&config)?;
+    
+    // Apply theme and show ASCII art
+    config.theme.apply();
+    println!("{}", config.theme.ascii_art());
 
     // ===== PHASE 5: Start Listener (SILENTLY) =====
     let state = Arc::new(Mutex::new(types::AppState {
@@ -163,9 +153,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Start interactive shell
-async fn start_shell(config: types::Config, state: Arc<Mutex<types::AppState>>) -> anyhow::Result<()> {
+async fn start_shell(mut config: types::Config, state: Arc<Mutex<types::AppState>>) -> anyhow::Result<()> {
     loop {
-        print!("[nite~]# ");
+        // Apply theme colors
+        print!("{}", config.theme.prompt());
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -181,25 +172,27 @@ async fn start_shell(config: types::Config, state: Arc<Mutex<types::AppState>>) 
         let cli = match Cli::try_parse_from(args) {
             Ok(cli) => cli,
             Err(e) => {
-                println!("[nite] Error: {}", e);
+                println!("{}", config.theme.error(&e.to_string()));
                 continue;
             }
         };
         match cli.command {
             Some(Commands::Init) => {
-                let config = config::initialize_silent()?;
-                println!("[nite] Re-initialized. Your NL-ID: {}", config.nl_id);
+                let new_config = config::initialize_silent()?;
+                println!("{}", config.theme.log(&format!("Re-initialized. Your NL-ID: {}", new_config.nl_id)));
+                config = new_config;
+                config::save(&config)?;
             }
             Some(Commands::Fingerprint) => {
-                println!("[nite] NightLink ID: {}", config.nl_id);
-                println!("[nite] Display name: {}", config.display_name);
+                println!("{}", config.theme.log(&format!("NightLink ID: {}", config.nl_id)));
+                println!("{}", config.theme.log(&format!("Display name: {}", config.display_name)));
                 let fingerprint = hex::encode(&config.public_key[..8]);
-                println!("[nite] Fingerprint: {}", fingerprint);
-                println!("[nite] Transport: tor");
+                println!("{}", config.theme.log(&format!("Fingerprint: {}", fingerprint)));
+                println!("{}", config.theme.log("Transport: tor"));
                 if let Some(addr) = &config.tor_address {
-                    println!("[nite] Tor address: {}", addr);
+                    println!("{}", config.theme.log(&format!("Tor address: {}", addr)));
                 } else {
-                    println!("[nite] Tor address: Not generated (hidden service failed)");
+                    println!("{}", config.theme.log("Tor address: Not generated (hidden service failed)"));
                 }
             }
             Some(Commands::ContactAdd { nl_id, alias, tor_address }) => {
@@ -207,10 +200,17 @@ async fn start_shell(config: types::Config, state: Arc<Mutex<types::AppState>>) 
                 let alias_clone = alias.clone();
                 let tor_address_clone = tor_address.clone();
                 config::add_contact(&mut config.clone(), nl_id, alias, tor_address)?;
-                println!("[nite] Contact added: {} ({}) -> {}", alias_clone, nl_id_clone, tor_address_clone);
+                println!("{}", config.theme.log(&format!("Contact added: {} ({}) -> {}", alias_clone, nl_id_clone, tor_address_clone)));
             }
             Some(Commands::ContactList) => {
-                config::list_contacts(&config);
+                if config.contacts.is_empty() {
+                    println!("{}", config.theme.log("No contacts"));
+                } else {
+                    println!("{}", config.theme.log("Contacts:"));
+                    for (nl_id, contact) in &config.contacts {
+                        println!("{}", config.theme.log(&format!("  {} ({}) -> {}", contact.alias, nl_id, contact.tor_address)));
+                    }
+                }
             }
             Some(Commands::Ping { target }) => {
                 chat::start_chat(&config, &state, &target).await?;
@@ -218,54 +218,69 @@ async fn start_shell(config: types::Config, state: Arc<Mutex<types::AppState>>) 
             Some(Commands::Pending) => {
                 let pending = state.lock().await;
                 if pending.pending_connections.is_empty() {
-                    println!("[nite] No pending connections");
+                    println!("{}", config.theme.log("No pending connections"));
                 } else {
-                    println!("[nite] Pending connections:");
+                    println!("{}", config.theme.log("Pending connections:"));
                     for (alias, _) in &pending.pending_connections {
-                        println!("[nite]   - {}", alias);
+                        println!("{}", config.theme.log(&format!("  - {}", alias)));
                     }
                 }
             }
             Some(Commands::Accept { alias }) => {
                 let mut state_lock = state.lock().await;
                 if let Some(stream) = state_lock.pending_connections.remove(&alias) {
-                    println!("[nite] Accepted connection from {}", alias);
+                    println!("{}", config.theme.log(&format!("Accepted connection from {}", alias)));
                     tokio::spawn(chat::handle_connection(
                         stream,
                         config.nl_id.clone(),
                         alias.clone(),
                     ));
                 } else {
-                    println!("[nite] No pending connection from {}", alias);
+                    println!("{}", config.theme.log(&format!("No pending connection from {}", alias)));
                 }
             }
             Some(Commands::Reject { alias }) => {
                 let mut state_lock = state.lock().await;
                 if state_lock.pending_connections.remove(&alias).is_some() {
-                    println!("[nite] Rejected connection from {}", alias);
+                    println!("{}", config.theme.log(&format!("Rejected connection from {}", alias)));
                 } else {
-                    println!("[nite] No pending connection from {}", alias);
+                    println!("{}", config.theme.log(&format!("No pending connection from {}", alias)));
                 }
             }
+            Some(Commands::Theme { name }) => {
+                config.theme = match name.as_str() {
+                    "default" => theme::Theme::Default,
+                    "matrix" => theme::Theme::Matrix,
+                    "nord" => theme::Theme::Nord,
+                    "dracula" => theme::Theme::Dracula,
+                    _ => {
+                        println!("{}", config.theme.error(&format!("Unknown theme: {}", name)));
+                        continue;
+                    }
+                };
+                println!("{}", config.theme.log(&format!("Theme set to: {:?}", config.theme)));
+                config::save(&config)?;
+            }
             Some(Commands::Help) => {
-                println!("\nCommands:");
-                println!("  init                     Initialize/reinitialize your identity");
-                println!("  fingerprint              Show your NL-ID and fingerprint");
-                println!("  contact add <nl-id> <alias> <tor-address>  Add a contact");
-                println!("  contact list             List contacts");
-                println!("  ping <alias>             Start a chat");
-                println!("  pending                  List pending connection requests");
-                println!("  accept <alias>           Accept a pending connection");
-                println!("  reject <alias>           Reject a pending connection");
-                println!("  help                     Show this help");
-                println!("  exit                     Quit\n");
+                println!("\n{}", config.theme.log("Commands:"));
+                println!("  {} - Initialize/reinitialize your identity", "\x1B[37minit\x1B[0m");
+                println!("  {} - Show your NL-ID and fingerprint", "\x1B[37mfingerprint\x1B[0m");
+                println!("  {} <theme> - Set theme (default/matrix/nord/dracula)", "\x1B[37mtheme\x1B[0m");
+                println!("  {} <nl-id> <alias> <tor-address> - Add a contact", "\x1B[37mcontact add\x1B[0m");
+                println!("  {} - List all contacts", "\x1B[37mcontact list\x1B[0m");
+                println!("  {} <alias> - Start a chat", "\x1B[37mping\x1B[0m");
+                println!("  {} - List pending connection requests", "\x1B[37mpending\x1B[0m");
+                println!("  {} <alias> - Accept a pending connection", "\x1B[37maccept\x1B[0m");
+                println!("  {} <alias> - Reject a pending connection", "\x1B[37mreject\x1B[0m");
+                println!("  {} - Show this help", "\x1B[37mhelp\x1B[0m");
+                println!("  {} - Quit", "\x1B[37mexit\x1B[0m");
             }
             Some(Commands::Exit) => {
-                println!("[nite] Goodbye!");
+                println!("{}", config.theme.log("Goodbye!"));
                 break;
             }
             None => {
-                println!("[nite] Unknown command. Type 'help' for available commands.");
+                println!("{}", config.theme.error("Unknown command. Type 'help' for available commands."));
             }
         }
     }

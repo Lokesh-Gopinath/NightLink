@@ -1,5 +1,6 @@
 use crate::types::{Config, NLID};
 use crate::crypto;
+use crate::theme;
 use crate::tor;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -40,7 +41,7 @@ pub async fn start_chat(config: &Config, state: &Arc<Mutex<crate::types::AppStat
                 _ => break,
             };
             let msg = String::from_utf8_lossy(&buf[..n]);
-            println!("[{}]: {}", peer_alias, msg);
+            println!("{}", theme::Theme::Default.user_msg(&peer_alias, &msg));
         }
     });
 
@@ -79,7 +80,7 @@ pub async fn handle_connection(
                 _ => break,
             };
             let msg = String::from_utf8_lossy(&buf[..n]);
-            println!("[{}]: {}", peer_alias, msg);
+            println!("{}", theme::Theme::Default.user_msg(&peer_alias, &msg));
         }
     });
 

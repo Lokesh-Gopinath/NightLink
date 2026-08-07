@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto;
+use crate::theme::Theme;
 use crate::types::{get_config_dir, get_config_path, Config, Contact, Error, format_nl_id};
 
 /// Legacy config format for backward compatibility
@@ -66,6 +67,7 @@ pub fn initialize() -> Result<Config, Error> {
         public_key: verifying_key.to_bytes().to_vec(),
         tor_address: None,
         contacts: HashMap::new(),
+        theme: Theme::default(),
     };
 
     save(&config)?;
@@ -90,6 +92,7 @@ pub fn initialize_silent() -> Result<Config, Error> {
         public_key: verifying_key.to_bytes().to_vec(),
         tor_address: None,
         contacts: HashMap::new(),
+        theme: Theme::default(),
     };
 
     let config_path = get_config_path();
@@ -149,6 +152,7 @@ pub fn load() -> Result<Config, Error> {
         public_key: legacy.public_key,
         tor_address: legacy.tor_address,
         contacts,
+        theme: Theme::default(),
     };
 
     save(&migrated)?;
