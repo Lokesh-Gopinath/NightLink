@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build NightLink
+        run: cargo build --release
+
+      - name: Verify binary
+        run: |
+          if (-not (Test-Path "target\release\nite.exe")) {
+            Write-Host "Available files in target/release:"
+            Get-ChildItem target\release\
+            throw "nite.exe not found! Check Cargo.toml [[bin]] name."
+          }
+
+      - name: Download Tor
+        run: |
+          $torVersion = "0.4.9.11"
+          $url = "https://dist.torproject.org/tor-$torVersion/tor-win32-$torVersion.zip"
+          Invoke-WebRequest -Uri $url -OutFile "tor.zip"
+          Expand-Archive -Path "tor.zip" -DestinationPath "."
+          Copy-Item ".\Tor\tor.exe" -Destination "target\release\"
+
+      - name: Create ZIP
+        run: |
+          $zipName = "NightLink-${{ github.ref_name }}.zip"
+          Compress-Archive -Path "target\release\nite.exe", "target\release\tor.exe", "README.md" -DestinationPath $zipName
+          Write-Host "Created $zipName"
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: NightLink-${{ github.ref_name }}.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}   # e.g. v1.2.0-beta → prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
