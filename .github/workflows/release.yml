@@ -57,6 +57,6 @@ jobs:
           files: NightLink-v*.zip
           generate_release_notes: true
           tag_name: ${{ github.ref_name }}
-          name: NightLink v${{ github.ref_name }}
+          name: NightLink ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
