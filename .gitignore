@@ -2,9 +2,8 @@
 /target
 **/*.rs.bk
 
-# Config files (user-specific)
+# Config files (user-specific; these live outside the repo in %APPDATA%)
 *.key
-*.toml
 
 # IDE
 .idea

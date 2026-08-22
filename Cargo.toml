@@ -1,0 +1,46 @@
+[package]
+name = "nite"
+version = "2.0.0"
+edition = "2021"
+description = "Tor-only P2P encrypted chat"
+license = "GPL-3.0"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+tokio = { version = "1.32", features = ["full"] }
+tokio-util = "0.7"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+owo-colors = "3.5"
+socks = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.7"
+directories = "5.0"
+ed25519-dalek = { version = "2.0", features = ["serde"] }
+aes-gcm = { version = "0.10", features = ["std"] }
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+argon2 = { version = "0.5", features = ["std"] }
+rpassword = "7.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.48", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+[dev-dependencies]
+tempfile = "3.8"
+assert_cmd = "2.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
