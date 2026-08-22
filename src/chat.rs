@@ -209,7 +209,7 @@ fn frame_text(data: &[u8]) -> String {
 /// Print a message from a background (spawned) task. A leading newline keeps
 /// the message on its own line instead of gluing onto the shell's active
 /// prompt line or leaving a dangling blank cursor line.
-fn bg_print(msg: &str) {
+pub(crate) fn bg_print(msg: &str) {
     println!("\n{}", msg);
 }
 
