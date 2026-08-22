@@ -122,7 +122,7 @@ git clone https://github.com/Lokesh-Gopinath/NightLink
 cd NightLink
 
 # Download tor.exe
-# Get from: https://www.torproject.org/dist/v0.4.8.10/tor-win32-0.4.8.10.zip
+# Get from: https://dist.torproject.org/torbrowser/15.0.20/tor-expert-bundle-windows-x86_64-15.0.20.tar.gz
 # Extract Tor/tor.exe to the project root
 
 # Build release

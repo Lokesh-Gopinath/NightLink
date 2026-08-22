@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build-and-release:
     runs-on: windows-latest
@@ -36,9 +39,12 @@ jobs:
 
       - name: Download Tor
         run: |
-          Invoke-WebRequest -Uri "https://dist.torproject.org/tor-0.4.9.11/tor-win32-0.4.9.11.zip" -OutFile "tor.zip"
-          Expand-Archive -Path "tor.zip" -DestinationPath "."
-          Copy-Item -Path ".\Tor\tor.exe" -Destination "target\release\"
+          Invoke-WebRequest -Uri "https://dist.torproject.org/torbrowser/15.0.20/tor-expert-bundle-windows-x86_64-15.0.20.tar.gz" -OutFile "tor.tar.gz"
+          tar -xzf tor.tar.gz
+          $torExe = Get-ChildItem -Path ".\tor" -Filter "tor.exe" -Recurse | Select-Object -First 1
+          if (-not $torExe) { Write-Error "tor.exe not found after extraction"; exit 1 }
+          Copy-Item -Path $torExe.FullName -Destination "target\release\"
+          Write-Host "Copied $($torExe.FullName) to target\release\"
 
       - name: Create release ZIP
         run: |
