@@ -208,10 +208,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ===== PHASE 2: Wait for Bootstrap =====
-    println!("[nite] Waiting for Tor to bootstrap...");
+    println!("[nite] Tor is bootstrapping... (may take up to 10 minutes)");
     if let Err(e) = tor::wait_for_full_bootstrap().await {
-        eprintln!("[nite] Error: {}", e);
-        eprintln!("[nite] Error: Tor failed to start. Check your connection/firewall or restart the application.");
+        eprintln!("[nite] Error: Failed to start Tor. Check your network/firewall or restart the application.");
+        eprintln!("[nite] Details: {}", e);
         pause_and_exit(1);
     }
 
