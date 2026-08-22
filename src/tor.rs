@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::fs;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -83,7 +83,11 @@ pub fn start_tor_daemon() -> Result<(PathBuf, String), anyhow::Error> {
         "--UseBridges", "0",
         "--Log", "notice stdout",
     ]);
-    command.stderr(Stdio::inherit());
+    // Tor writes its own logs to stdout/stderr. Suppress them so raw notices
+    // (e.g. timeout recalibration) never interleave with the NightLink UI.
+    // Failures still surface through our own timeouts and error messages.
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
     
     command.spawn()?;
 
@@ -104,36 +108,48 @@ pub fn start_tor_daemon() -> Result<(PathBuf, String), anyhow::Error> {
     Err(anyhow::anyhow!("Failed to generate .onion address. Check %APPDATA%\\nite\\tor\\hidden_service\\ for errors."))
 }
 
-/// Wait for FULL bootstrap (7 minutes)
+/// Maximum time we are willing to wait for Tor to reach full bootstrap.
+pub const BOOTSTRAP_TIMEOUT_SECS: u64 = 600;
+
+/// Wait until Tor can actually build circuits (full bootstrap), printing
+/// friendly progress updates to the console. Gives slow/unstable networks a
+/// full 10 minutes instead of failing early.
 pub async fn wait_for_full_bootstrap() -> Result<(), anyhow::Error> {
-    info!("Waiting for Tor to bootstrap (this may take 1-2 minutes)...");
-    for i in 0..420 {
-        if is_tor_ready().await {
-            if i > 60 && i % 30 == 0 {
-                info!("Still waiting for Tor... ({}s elapsed)", i);
-            }
-            if is_tor_fully_bootstrapped().await {
-                info!("Tor fully bootstrapped!");
-                return Ok(());
-            }
+    let timeout = Duration::from_secs(BOOTSTRAP_TIMEOUT_SECS);
+    let started = Instant::now();
+    let mut last_reported: u64 = 0;
+
+    while started.elapsed() < timeout {
+        // Completion check: SOCKS port open AND a real circuit works.
+        if is_tor_ready().await && is_tor_fully_bootstrapped().await {
+            println!(
+                "[nite] Tor connected successfully ({}s).",
+                started.elapsed().as_secs()
+            );
+            return Ok(());
+        }
+
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= last_reported + 30 {
+            last_reported = elapsed;
+            println!("[nite] Still bootstrapping... {}s elapsed.", elapsed);
         }
         sleep(Duration::from_secs(1)).await;
     }
-    error!("Tor failed to bootstrap within 7 minutes");
+
     Err(anyhow::anyhow!(
-        "Tor failed to bootstrap.\n\
-        🔍 DEBUG INFO:\n\
-        1. Check if tor.exe is in the same folder as nite.exe\n\
-        2. Run `tor.exe --version` manually to verify it works\n\
-        3. Check %APPDATA%\\nite\\tor\\notices.log for Tor errors\n\
-        4. Try on a different network (some ISPs block Tor)\n\
-        5. Allow 'tor.exe' through Windows Firewall"
+        "Tor did not finish bootstrapping within 10 minutes.\n\
+         Common causes:\n\
+         1. Your network or firewall is blocking Tor\n\
+         2. Your internet connection is unstable\n\
+         3. Your system clock is incorrect\n\
+         Please check your connection and restart NightLink."
     ))
 }
 
-/// Check if Tor can build circuits
+/// Check if Tor can build circuits (single attempt; used by bootstrap polling)
 pub async fn is_tor_fully_bootstrapped() -> bool {
-    match connect_via_tor("check.torproject.org:443").await {
+    match connect_via_tor_once("check.torproject.org:443").await {
         Ok(_) => true,
         Err(e) => {
             warn!("Tor circuit test failed: {}", e);
@@ -153,9 +169,53 @@ fn parse_address(address: &str) -> anyhow::Result<(String, u16)> {
     }
 }
 
+/// Connect through the local Tor SOCKS5 proxy, retrying transient failures
+/// up to 3 times before giving up.
 pub async fn connect_via_tor(address: &str) -> anyhow::Result<TcpStream> {
     start_tor_daemon()?;
+    connect_with_retries(address, 3).await
+}
 
+/// Single-attempt variant used by internal health probes (retrying there
+/// would slow down bootstrap polling).
+pub async fn connect_via_tor_once(address: &str) -> anyhow::Result<TcpStream> {
+    start_tor_daemon()?;
+    connect_with_retries(address, 1).await
+}
+
+async fn connect_with_retries(
+    address: &str,
+    max_attempts: u32,
+) -> anyhow::Result<TcpStream> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=max_attempts {
+        match try_connect_via_socks(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < max_attempts {
+                    crate::chat::bg_print(&format!(
+                        "[nite] Tor connection unstable. Retrying (attempt {}/{}).",
+                        attempt + 1,
+                        max_attempts
+                    ));
+                    sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Tor connection failed after {} attempts: {}. \
+         Check your network/firewall or restart NightLink.",
+        max_attempts,
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
+/// One SOCKS5 connection attempt through the local Tor proxy.
+async fn try_connect_via_socks(address: &str) -> anyhow::Result<TcpStream> {
     let (host, port) = parse_address(address)?;
     let proxy_addr: SocketAddr = TOR_PROXY_ADDR.parse()?;
 
