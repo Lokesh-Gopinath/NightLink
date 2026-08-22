@@ -1,0 +1,7 @@
+# Statically link the MSVC C runtime so nite.exe runs standalone
+# (no VCRUNTIME140.dll / MSVCP140.dll dependency on clean Windows installs).
+#
+# NOTE: the correct mechanism is the `crt-static` target feature; passing
+# `/MT` as a link-arg does not work (it is a cl.exe flag, not a linker flag).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
