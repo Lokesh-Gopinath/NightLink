@@ -29,6 +29,8 @@ struct LegacyContact {
     nl_id: String,
     alias: Option<String>,
     tor_address: Option<String>,
+    #[serde(default)]
+    public_key: Option<Vec<u8>>,
 }
 
 fn prompt_line(prompt: &str) -> Result<String, Error> {
@@ -75,7 +77,7 @@ pub fn initialize() -> Result<Config, Error> {
     Ok(config)
 }
 
-pub fn initialize_silent() -> Result<Config, Error> {
+pub fn initialize_silent() -> Result<(Config, String), Error> {
     let config_dir = get_config_dir();
     fs::create_dir_all(&config_dir)?;
 
@@ -98,7 +100,7 @@ pub fn initialize_silent() -> Result<Config, Error> {
     let config_path = get_config_path();
     for _ in 0..3 {
         match fs::write(&config_path, toml::to_string(&config)?) {
-            Ok(_) => return Ok(config),
+            Ok(_) => return Ok((config, passphrase)),
             Err(e) if e.to_string().contains("being used by another process") => {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -119,45 +121,57 @@ pub fn reinitialize() -> Result<Config, Error> {
 pub fn load() -> Result<Config, Error> {
     let config = fs::read_to_string(get_config_path())?;
 
+    // Try parsing as new format first
     if let Ok(config) = toml::from_str::<Config>(&config) {
         return Ok(config);
     }
 
-    let legacy: LegacyConfig = toml::from_str(&config)?;
-    let mut contacts = HashMap::new();
-    for contact in legacy.contacts {
-        contacts.insert(
-            contact.nl_id.clone(),
-            Contact {
-                alias: contact.alias.unwrap_or_else(|| contact.nl_id.clone()),
-                tor_address: contact.tor_address.unwrap_or_default(),
-            },
-        );
+    // Try parsing as legacy format
+    if let Ok(legacy) = toml::from_str::<LegacyConfig>(&config) {
+        let mut contacts = HashMap::new();
+        for contact in legacy.contacts {
+            contacts.insert(
+                contact.nl_id.clone(),
+                Contact {
+                    nl_id: contact.nl_id.clone(),
+                    alias: contact.alias.unwrap_or_else(|| contact.nl_id.clone()),
+                    tor_address: contact.tor_address.unwrap_or_default(),
+                    public_key: contact.public_key.unwrap_or_default(),
+                },
+            );
+        }
+
+        let private_key_encrypted = if let (Some(salt), Some(nonce)) = (&legacy.salt, &legacy.nonce) {
+            let mut blob = Vec::with_capacity(salt.len() + nonce.len() + legacy.private_key_encrypted.len());
+            blob.extend_from_slice(salt);
+            blob.extend_from_slice(nonce);
+            blob.extend_from_slice(&legacy.private_key_encrypted);
+            blob
+        } else {
+            legacy.private_key_encrypted
+        };
+
+        let migrated = Config {
+            nl_id: legacy.nl_id,
+            display_name: legacy.display_name,
+            private_key_encrypted,
+            public_key: legacy.public_key,
+            tor_address: legacy.tor_address,
+            contacts,
+            theme: Theme::default(),
+        };
+
+        save(&migrated)?;
+        println!("[nite] Migrated config to new format");
+        return Ok(migrated);
     }
 
-    let private_key_encrypted = if let (Some(salt), Some(nonce)) = (&legacy.salt, &legacy.nonce) {
-        let mut blob = Vec::with_capacity(salt.len() + nonce.len() + legacy.private_key_encrypted.len());
-        blob.extend_from_slice(salt);
-        blob.extend_from_slice(nonce);
-        blob.extend_from_slice(&legacy.private_key_encrypted);
-        blob
-    } else {
-        legacy.private_key_encrypted
-    };
-
-    let migrated = Config {
-        nl_id: legacy.nl_id,
-        display_name: legacy.display_name,
-        private_key_encrypted,
-        public_key: legacy.public_key,
-        tor_address: legacy.tor_address,
-        contacts,
-        theme: Theme::default(),
-    };
-
-    save(&migrated)?;
-    println!("[nite] Migrated config to new format");
-    Ok(migrated)
+    // If both fail, return a helpful error
+    Err(anyhow::anyhow!(
+        "Config file is corrupted or in an unsupported format.\n\
+        Please delete {} and run 'init' to create a new config.",
+        get_config_path().display()
+    ))
 }
 
 pub fn save(config: &Config) -> Result<(), Error> {
@@ -184,8 +198,19 @@ pub fn print_fingerprint(config: &Config) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn add_contact(config: &mut Config, nl_id: String, alias: String, tor_address: String) -> Result<(), Error> {
-    config.contacts.insert(nl_id.clone(), Contact { alias, tor_address });
+pub fn add_contact(
+    config: &mut Config,
+    nl_id: String,
+    alias: String,
+    tor_address: String,
+    public_key: Vec<u8>,
+) -> Result<(), Error> {
+    config.contacts.insert(nl_id.clone(), Contact {
+        nl_id: nl_id.clone(),
+        alias,
+        tor_address,
+        public_key,
+    });
     save(config)?;
     println!("[nite] Contact saved: {}", nl_id);
     Ok(())

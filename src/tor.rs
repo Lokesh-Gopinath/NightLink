@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::fs;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tracing::{info, error, warn};
 
@@ -35,8 +35,24 @@ pub async fn is_tor_ready() -> bool {
     }
 }
 
+/// Check if Tor is already running
+pub fn is_tor_running() -> bool {
+    use std::net::TcpStream;
+    TcpStream::connect("127.0.0.1:9050").is_ok()
+}
+
 /// Start Tor daemon + create hidden service, returns (hs_dir, onion_address)
 pub fn start_tor_daemon() -> Result<(PathBuf, String), anyhow::Error> {
+    // FIX: Check if Tor is already running
+    if is_tor_running() {
+        let hs_dir = crate::types::get_config_dir().join("tor/hidden_service/hostname");
+        if hs_dir.exists() {
+            let onion_addr = std::fs::read_to_string(&hs_dir)?.trim().to_string();
+            return Ok((hs_dir.parent().unwrap().to_path_buf(), onion_addr));
+        }
+        return Err(anyhow::anyhow!("Tor is running but no hidden service found"));
+    }
+
     let tor_path = get_tor_path();
     if !tor_path.exists() {
         return Err(anyhow::anyhow!(
@@ -191,24 +207,4 @@ pub async fn connect_via_tor(address: &str) -> anyhow::Result<TcpStream> {
     }
 
     Ok(stream)
-}
-
-pub async fn create_listener(port: u16) -> anyhow::Result<TcpListener> {
-    TcpListener::bind(("0.0.0.0", port)).await.map_err(Into::into)
-}
-
-pub async fn read_nl_id_from_stream(stream: &mut TcpStream) -> anyhow::Result<String> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut nl_id_buf = vec![0u8; len];
-    stream.read_exact(&mut nl_id_buf).await?;
-    Ok(String::from_utf8(nl_id_buf)?)
-}
-
-pub async fn send_nl_id(stream: &mut TcpStream, nl_id: &str) -> anyhow::Result<()> {
-    let len = nl_id.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(nl_id.as_bytes()).await?;
-    Ok(())
 }

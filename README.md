@@ -2,11 +2,19 @@
 
 A minimal, privacy-focused chat application that runs exclusively over the Tor network.
 
+## ⚠️ Important
+
+**Only v2.0.0 and later are functional.** Earlier releases (v1.x) were development snapshots and **do not work**.
+
+[Download Latest Release](https://github.com/Lokesh-Gopinath/NightLink/releases/latest)
+
 ## Features
 ✅ Tor-only (no direct mode)
-✅ End-to-end encrypted chat
+✅ End-to-End Encryption (X25519 + ChaCha20-Poly1305)
+✅ Identity authentication (Ed25519 signatures)
+✅ Working P2P chat (real network connections)
 ✅ Auto-generated NL-ID
-✅ Contact management
+✅ Contact management (+ optional public keys)
 ✅ Connection notifications (accept/reject)
 ✅ Fast Tor bootstrap (~30-60s)
 ✅ Debug mode for troubleshooting
@@ -60,8 +68,9 @@ Type: `accept alice`
 |---------|-------------|
 | `init` | Initialize your identity |
 | `fingerprint` | Show your NL-ID and Tor address |
-| `contact add` | Add a contact |
+| `contact add` | Add a contact (optional `--public-key <HEX>`) |
 | `contact list` | List contacts |
+| `theme` | Set color theme (default/matrix/nord/dracula) |
 | `ping` | Start a chat |
 | `pending` | Show pending connections |
 | `accept` | Accept a chat request |
@@ -109,8 +118,8 @@ RUST_LOG=debug ./nite
 ### Build Steps
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/nite
-cd nite
+git clone https://github.com/Lokesh-Gopinath/NightLink
+cd NightLink
 
 # Download tor.exe
 # Get from: https://www.torproject.org/dist/v0.4.8.10/tor-win32-0.4.8.10.zip
