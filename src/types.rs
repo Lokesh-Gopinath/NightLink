@@ -11,6 +11,11 @@ use chacha20poly1305::ChaCha20Poly1305;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+/// The prompt text most recently drawn by the shell. Background printers use
+/// it to redraw a fresh prompt after emitting async output, so the user never
+/// has to press Enter just to get the input line back.
+pub static LAST_PROMPT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 pub type NLID = String;
 pub type Error = anyhow::Error;
 

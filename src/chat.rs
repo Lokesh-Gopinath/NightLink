@@ -18,6 +18,7 @@
 //! over the ephemeral and static key pairs (see `crypto`), so every `MSG`
 //! frame is encrypted end-to-end.
 
+use std::io::{self, Write as StdIoWrite};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -206,11 +207,27 @@ fn frame_text(data: &[u8]) -> String {
     String::from_utf8_lossy(data).trim().to_string()
 }
 
-/// Print a message from a background (spawned) task. A leading newline keeps
-/// the message on its own line instead of gluing onto the shell's active
-/// prompt line or leaving a dangling blank cursor line.
+/// Print a message from a background (spawned) task without breaking the
+/// shell's input line.
+///
+/// If the shell is currently showing a prompt, the interrupted line is
+/// cleared, the message is printed on its own line, and the prompt is redrawn
+/// immediately below it — so the user sees the message and can keep typing
+/// with no blank lines and no extra Enter press. If no prompt is on screen
+/// (e.g. during startup), the message is printed plainly.
 pub(crate) fn bg_print(msg: &str) {
-    println!("\n{}", msg);
+    let prompt = crate::types::LAST_PROMPT
+        .lock()
+        .map(|p| p.clone())
+        .unwrap_or_default();
+
+    if prompt.is_empty() {
+        println!("{}", msg);
+        return;
+    }
+
+    print!("\x1B[2K\r{}\n{}", msg, prompt);
+    let _ = io::stdout().flush();
 }
 
 // ============================ listener / incoming ============================
