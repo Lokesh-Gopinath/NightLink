@@ -26,20 +26,6 @@ fn clear_terminal() {
     }
 }
 
-/// Show NIGHTLINK ASCII art (used in main)
-#[allow(dead_code)]
-fn show_logo() {
-    println!(
-        r#"
-  ███╗   ██╗    ██╗     ██████╗     ██╗  ██╗    ████████╗    ██╗         ██╗    ███╗   ██╗    ██╗  ██╗
-  ████╗  ██║    ██║    ██╔════╝     ██║  ██║    ╚══██╔══╝    ██║         ██║    ████╗  ██║    ██║ ██╔╝
-  ██╔██╗ ██║    ██║    ██║  ███╗    ███████║       ██║       ██║         ██║    ██╔██╗ ██║    █████╔╝
-  ██║╚██╗██║    ██║    ██║   ██║    ██╔══██║       ██║       ██║         ██║    ██║╚██╗██║    ██╔═██╗
-  ██║ ╚████║    ██║    ╚██████╔╝    ██║  ██║       ██║       ███████╗    ██║    ██║ ╚████║    ██║  ██╗
-  ╚═╝  ╚═══╝    ╚═╝     ╚═════╝     ╚═╝  ╚═╝       ╚═╝       ╚══════╝    ╚═╝    ╚═╝  ╚═══╝    ╚═╝  ╚═╝
-"#
-    );
-}
 
 /// Pause and exit
 fn pause_and_exit(code: i32) -> ! {
@@ -125,6 +111,27 @@ fn get_suggestion(input: &str, commands: &[&str]) -> Option<String> {
         .map(|&s| s.to_string())
 }
 
+/// Validate a display name: 1-32 characters, restricted to letters, numbers,
+/// spaces, hyphens and underscores.
+fn validate_display_name(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("display name cannot be empty.".to_string());
+    }
+    if trimmed.chars().count() > 32 {
+        return Err("display name must be at most 32 characters.".to_string());
+    }
+    let valid = trimmed
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '_');
+    if !valid {
+        return Err(
+            "only letters, numbers, spaces, hyphens and underscores are allowed.".to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "nite")]
 #[command(about = "Tor-only P2P encrypted chat", long_about = None)]
@@ -160,6 +167,12 @@ enum Commands {
     Pending,
     Accept { alias: String },
     Reject { alias: String },
+    /// Change your display name
+    #[command(name = "set-display-name", alias = "set-name")]
+    SetDisplayName {
+        /// New display name (1-32 chars: letters, numbers, spaces, hyphens, underscores)
+        name: String,
+    },
     Theme { name: String },
     Help,
     Exit,
@@ -290,6 +303,14 @@ async fn start_shell(
             print!("{}", config.theme.prompt());
         }
         io::stdout().flush()?;
+        // Remember what is on screen so background messages can redraw the
+        // prompt after themselves instead of leaving a dangling blank line.
+        if let Ok(mut last_prompt) = types::LAST_PROMPT.lock() {
+            *last_prompt = chat_with
+                .as_ref()
+                .map(|alias| format!("[nite~{}]: ", alias))
+                .unwrap_or_else(|| config.theme.prompt());
+        }
 
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
@@ -610,12 +631,32 @@ async fn start_shell(
                 }
             }
 
+                        Some(Commands::SetDisplayName { name }) => {
+                match validate_display_name(&name) {
+                    Ok(()) => {
+                        config.display_name = name.trim().to_string();
+                        config::save(&config)?;
+                        println!(
+                            "{}",
+                            config.theme.log(&format!(
+                                "Display name updated to: {}",
+                                config.display_name
+                            ))
+                        );
+                    }
+                    Err(msg) => {
+                        println!("{}", config.theme.error(&format!("Invalid display name: {}", msg)));
+                    }
+                }
+            }
+
             Some(Commands::Theme { name }) => {
                 config.theme = match name.as_str() {
                     "default" => theme::Theme::Default,
                     "matrix" => theme::Theme::Matrix,
                     "nord" => theme::Theme::Nord,
                     "dracula" => theme::Theme::Dracula,
+                    "mist" => theme::Theme::Mist,
                     _ => {
                         println!("{}", config.theme.error(&format!("Unknown theme: {}", name)));
                         continue;
@@ -629,7 +670,8 @@ async fn start_shell(
                 println!("\n{}", config.theme.log("Commands:"));
                 println!("  {} - Initialize/reinitialize your identity", "\x1B[37minit\x1B[0m");
                 println!("  {} - Show your NL-ID and fingerprint", "\x1B[37mfingerprint\x1B[0m");
-                println!("  {} <theme> - Set theme (default/matrix/nord/dracula)", "\x1B[37mtheme\x1B[0m");
+                println!("  {} <name> - Change your display name", "\x1B[37mset-display-name\x1B[0m");
+                println!("  {} <theme> - Set theme (default/matrix/nord/dracula/mist)", "\x1B[37mtheme\x1B[0m");
                 println!("  {} <nl-id> <alias> <tor-address> - Add a contact", "\x1B[37mcontact add\x1B[0m");
                 println!("  {} - List all contacts", "\x1B[37mcontact list\x1B[0m");
                 println!("  {} <alias> - Start a chat", "\x1B[37mping\x1B[0m");
@@ -653,4 +695,28 @@ async fn start_shell(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::validate_display_name;
+
+    #[test]
+    fn accepts_valid_display_names() {
+        assert!(validate_display_name("alice").is_ok());
+        assert!(validate_display_name("New Name").is_ok());
+        assert!(validate_display_name("a-b_C d").is_ok());
+        assert!(validate_display_name("  padded  ").is_ok(), "surrounding spaces are trimmed before validation");
+        assert!(validate_display_name(&"a".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_display_names() {
+        assert!(validate_display_name("").is_err());
+        assert!(validate_display_name("   ").is_err());
+        assert!(validate_display_name("bad!name").is_err());
+        assert!(validate_display_name("no@ats").is_err());
+        let too_long = "a".repeat(33);
+        assert!(validate_display_name(&too_long).is_err());
+    }
 }
