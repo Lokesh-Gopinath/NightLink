@@ -89,7 +89,7 @@ pub fn initialize_silent() -> Result<(Config, String), Error> {
 
     let config = Config {
         nl_id,
-        display_name: "anonymous".to_string(),
+        display_name: String::new(),
         private_key_encrypted: encrypted_key,
         public_key: verifying_key.to_bytes().to_vec(),
         tor_address: None,

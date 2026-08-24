@@ -274,6 +274,34 @@ async fn main() -> anyhow::Result<()> {
     // shell prompt that start_shell prints next.
     println!("[nite] Listening for connections on {}...", chat::LISTEN_ADDR);
 
+    // ===== First-run display name prompt =====
+    // Only shown when the stored display name is empty (fresh identity).
+    if config.display_name.is_empty() {
+        print!("[nite] Enter your display name: ");
+        io::stdout().flush()?;
+        let mut name = String::new();
+        io::stdin().read_line(&mut name)?;
+        let name = name.trim().to_string();
+
+        if name.is_empty() {
+            config.display_name = "User".to_string();
+            println!("[nite] Using default display name: User");
+        } else if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_')
+        {
+            config.display_name = "User".to_string();
+            println!("[nite] Invalid characters. Using default display name: User");
+        } else if name.len() > 32 {
+            config.display_name = name[..32].to_string();
+            println!("[nite] Display name truncated to 32 characters");
+        } else {
+            config.display_name = name;
+        }
+
+        config::save(&config)?;
+    }
+
     // ===== PHASE 6: Interactive Shell =====
     start_shell(config, state, identity).await?;
 
