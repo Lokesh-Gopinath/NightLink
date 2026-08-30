@@ -68,9 +68,7 @@ fn unlock_identity(
     loop {
         let passphrase = match first_run_passphrase.take() {
             Some(p) => p,
-            None => {
-                rpassword::prompt_password("[nite] Enter your passphrase to unlock your identity: ")?
-            }
+            None => config::prompt_masked("[nite] Enter your passphrase to unlock your identity: ")?,
         };
         match crypto::decrypt_private_key(&config.private_key_encrypted, &passphrase) {
             Ok(seed) => {
@@ -163,6 +161,9 @@ enum Commands {
     /// Flat alternative: contact-list
     #[command(name = "contact-list")]
     ContactList,
+    /// Flat alternative: delete a contact without the `contact` prefix
+    #[command(name = "del", alias = "rm")]
+    DeleteContact { alias: String },
     Ping { target: String },
     Pending,
     Accept { alias: String },
@@ -188,6 +189,9 @@ enum ContactCommands {
         #[arg(long, value_name = "HEX")]
         public_key: Option<String>,
     },
+    /// Delete a contact by alias
+    #[command(alias = "remove")]
+    Delete { alias: String },
     List,
 }
 
@@ -308,15 +312,56 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Start interactive shell
+/// Read one completed line through the stdin worker. Must only be called while
+/// the worker is idle (i.e. between the shell's own line requests), so modal
+/// prompts like `(y/n)` can safely read a line without racing the shell.
+fn stdin_read_line(
+    want_tx: &std::sync::mpsc::Sender<()>,
+    got_rx: &std::sync::mpsc::Receiver<String>,
+) -> anyhow::Result<String> {
+    want_tx.send(())?;
+    got_rx.recv().map_err(|_| anyhow::anyhow!("stdin closed"))
+}
+
+/// Start interactive shell.
+///
+/// Input is read by a small worker thread that only reads a line when asked:
+/// the shell requests one line at a time, so modal inputs (passphrase, y/n
+/// prompts) that talk to the console directly never race with the worker.
+/// While waiting for a line the shell polls the chat state so an accepted
+/// connection switches the prompt to the chat prompt immediately, without the
+/// user having to press an extra Enter.
 #[allow(clippy::too_many_arguments)]
 async fn start_shell(
     mut config: types::Config,
     state: Arc<Mutex<AppState>>,
     mut identity: types::IdentityKeys,
 ) -> anyhow::Result<()> {
+    // ---- stdin worker: one line per request ----
+    let (want_tx, want_rx) = std::sync::mpsc::channel::<()>();
+    let (got_tx, got_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        while want_rx.recv().is_ok() {
+            let mut line = String::new();
+            match stdin.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if got_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Whether the UI currently shows a chat prompt (for transition redraws).
+    let mut in_chat = false;
+    // Whether the current prompt line is already on screen.
+    let mut prompt_drawn = false;
+
     loop {
-        // Check if in chat mode
+        // Current chat partner (None = main prompt).
         let chat_with = {
             let state_guard = state.lock().await;
             state_guard
@@ -324,26 +369,59 @@ async fn start_shell(
                 .as_ref()
                 .map(|session| session.peer_alias.clone())
         };
+        let now_in_chat = chat_with.is_some();
 
-        if let Some(chat_with) = &chat_with {
-            print!("[nite~{}]: ", chat_with);
-        } else {
-            print!("{}", config.theme.prompt());
+        // ---- draw / re-draw the right prompt when the state changed ----
+        if now_in_chat != in_chat {
+            in_chat = now_in_chat;
+            if let Some(alias) = &chat_with {
+                let p = format!("[nite~{}]: ", alias);
+                // If a background task already drew the chat prompt (and
+                // bumped LAST_PROMPT), don't print a second one.
+                let already = types::LAST_PROMPT.lock().map(|lp| *lp == p).unwrap_or(false);
+                if !already {
+                    print!("{}", p);
+                    io::stdout().flush()?;
+                    if let Ok(mut lp) = types::LAST_PROMPT.lock() {
+                        *lp = p;
+                    }
+                }
+                prompt_drawn = true;
+            } else {
+                let p = config.theme.prompt();
+                print!("{}", p);
+                io::stdout().flush()?;
+                if let Ok(mut lp) = types::LAST_PROMPT.lock() {
+                    *lp = p;
+                }
+                prompt_drawn = true;
+            }
+        } else if !prompt_drawn {
+            let p = if let Some(alias) = &chat_with {
+                format!("[nite~{}]: ", alias)
+            } else {
+                config.theme.prompt()
+            };
+            print!("{}", p);
+            io::stdout().flush()?;
+            if let Ok(mut lp) = types::LAST_PROMPT.lock() {
+                *lp = p;
+            }
+            prompt_drawn = true;
         }
-        io::stdout().flush()?;
-        // Remember what is on screen so background messages can redraw the
-        // prompt after themselves instead of leaving a dangling blank line.
-        if let Ok(mut last_prompt) = types::LAST_PROMPT.lock() {
-            *last_prompt = chat_with
-                .as_ref()
-                .map(|alias| format!("[nite~{}]: ", alias))
-                .unwrap_or_else(|| config.theme.prompt());
+
+        // ---- request one line; poll chat state while waiting ----
+        if want_tx.send(()).is_err() {
+            break; // stdin closed
         }
+        let line = match got_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break, // stdin closed
+        };
+        prompt_drawn = false;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-
+        let input = line.trim().to_string();
         if input.is_empty() {
             continue;
         }
@@ -355,8 +433,8 @@ async fn start_shell(
         }
 
         // If in chat mode, send the input as a network message
-        if chat_with.is_some() {
-            if let Err(e) = chat::send_message(state.clone(), input).await {
+        if now_in_chat {
+            if let Err(e) = chat::send_message(state.clone(), &input).await {
                 println!("{}", config.theme.error(&format!("Failed to send: {}. Connection may be lost.", e)));
                 let mut state_guard = state.lock().await;
                 state_guard.current_chat = None;
@@ -370,7 +448,7 @@ async fn start_shell(
             Ok(cli) => cli,
             Err(e) => {
                 let suggestions = ["init", "fingerprint", "contact add", "contact list", "ping", "pending", "accept", "reject", "help", "exit"];
-                if let Some(suggestion) = get_suggestion(input, &suggestions) {
+                if let Some(suggestion) = get_suggestion(&input, &suggestions) {
                     println!("{}", config.theme.error(&format!("Unknown command. Did you mean '{}'?", suggestion)));
                 } else {
                     println!("{}", config.theme.error(&e.to_string()));
@@ -464,11 +542,16 @@ async fn start_shell(
                             continue;
                         }
 
+                        // Reject duplicate aliases (case-insensitive) on another contact.
+                        if config::alias_taken(&config, &alias, Some(&nl_id)) {
+                            println!("{}", config.theme.error(&format!("A contact with alias '{}' already exists", alias)));
+                            continue;
+                        }
+
                         // Check if contact already exists
                         if config.contacts.contains_key(&nl_id) {
                             println!("{}", config.theme.error(&format!("{} already exists. Update? (y/n)", alias)));
-                            let mut choice = String::new();
-                            io::stdin().read_line(&mut choice)?;
+                            let choice = stdin_read_line(&want_tx, &got_rx)?;
                             if choice.trim().to_lowercase() != "y" {
                                 continue;
                             }
@@ -504,6 +587,24 @@ async fn start_shell(
                             for (_, contact) in &config.contacts {
                                 println!("{}", config.theme.log(&format!("  {} ({}) -> {}", contact.alias, contact.nl_id, contact.tor_address)));
                             }
+                        }
+                    }
+                    ContactCommands::Delete { alias } => {
+                        print!("{}", config.theme.log(&format!("Are you sure you want to delete {}? (y/n): ", alias)));
+                        io::stdout().flush()?;
+                        let choice = stdin_read_line(&want_tx, &got_rx)?;
+                        if choice.trim().to_lowercase() != "y" {
+                            continue;
+                        }
+                        match config::remove_contact_by_alias(&mut config, &alias) {
+                            Ok(true) => {
+                                config::save(&config)?;
+                                println!("{}", config.theme.log(&format!("Contact {} deleted", alias)));
+                            }
+                            Ok(false) => {
+                                println!("{}", config.theme.error(&format!("Contact {} not found", alias)));
+                            }
+                            Err(e) => println!("{}", config.theme.error(&format!("{}", e))),
                         }
                     }
                 }
@@ -543,11 +644,16 @@ async fn start_shell(
                     continue;
                 }
 
+                // Reject duplicate aliases (case-insensitive) on another contact.
+                if config::alias_taken(&config, &alias, Some(&nl_id)) {
+                    println!("{}", config.theme.error(&format!("A contact with alias '{}' already exists", alias)));
+                    continue;
+                }
+
                 // Check if contact already exists
                 if config.contacts.contains_key(&nl_id) {
                     println!("{}", config.theme.error(&format!("{} already exists. Update? (y/n)", alias)));
-                    let mut choice = String::new();
-                    io::stdin().read_line(&mut choice)?;
+                    let choice = stdin_read_line(&want_tx, &got_rx)?;
                     if choice.trim().to_lowercase() != "y" {
                         continue;
                     }
@@ -584,6 +690,33 @@ async fn start_shell(
                     for (_, contact) in &config.contacts {
                         println!("{}", config.theme.log(&format!("  {} ({}) -> {}", contact.alias, contact.nl_id, contact.tor_address)));
                     }
+                }
+            }
+
+            Some(Commands::DeleteContact { alias }) => {
+                print!("{}", config.theme.log(&format!("Are you sure you want to delete {}? (y/n): ", alias)));
+                io::stdout().flush()?;
+                let choice_status = stdin_read_line(&want_tx, &got_rx);
+                match choice_status {
+                    Ok(choice) => {
+                        if choice.trim().to_lowercase() != "y" {
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        println!("{}", config.theme.error(&format!("{}", e)));
+                        continue;
+                    }
+                }
+                match config::remove_contact_by_alias(&mut config, &alias) {
+                    Ok(true) => {
+                        config::save(&config)?;
+                        println!("{}", config.theme.log(&format!("Contact {} deleted", alias)));
+                    }
+                    Ok(false) => {
+                        println!("{}", config.theme.error(&format!("Contact {} not found", alias)));
+                    }
+                    Err(e) => println!("{}", config.theme.error(&format!("{}", e))),
                 }
             }
 
@@ -701,7 +834,9 @@ async fn start_shell(
                 println!("  {} <name> - Change your display name", "\x1B[37mset-display-name\x1B[0m");
                 println!("  {} <theme> - Set theme (default/matrix/nord/dracula/mist)", "\x1B[37mtheme\x1B[0m");
                 println!("  {} <nl-id> <alias> <tor-address> - Add a contact", "\x1B[37mcontact add\x1B[0m");
+                println!("  {} <alias> - Delete a contact", "\x1B[37mcontact delete\x1B[0m");
                 println!("  {} - List all contacts", "\x1B[37mcontact list\x1B[0m");
+                println!("  {} <alias> or {} <alias> - Delete a contact", "\x1B[37mdel\x1B[0m", "\x1B[37mrm\x1B[0m");
                 println!("  {} <alias> - Start a chat", "\x1B[37mping\x1B[0m");
                 println!("  {} - List pending connection requests", "\x1B[37mpending\x1B[0m");
                 println!("  {} <alias> - Accept a pending connection", "\x1B[37maccept\x1B[0m");
@@ -746,5 +881,50 @@ mod display_name_tests {
         assert!(validate_display_name("no@ats").is_err());
         let too_long = "a".repeat(33);
         assert!(validate_display_name(&too_long).is_err());
+    }
+}
+#[cfg(test)]
+mod cli_parse_tests {
+    use super::{Cli, Commands, ContactCommands};
+    use clap::Parser;
+
+    #[test]
+    fn parses_all_delete_variants() {
+        // contact delete <alias>
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "contact", "delete", "alice"]).unwrap().command,
+            Some(Commands::Contact { command: ContactCommands::Delete { .. } })
+        ));
+        // contact remove <alias> (alias of delete)
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "contact", "remove", "alice"]).unwrap().command,
+            Some(Commands::Contact { command: ContactCommands::Delete { .. } })
+        ));
+        // del <alias>
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "del", "alice"]).unwrap().command,
+            Some(Commands::DeleteContact { .. })
+        ));
+        // rm <alias>
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "rm", "alice"]).unwrap().command,
+            Some(Commands::DeleteContact { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_contact_add_and_list() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "nite", "contact", "add", "NL-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG", "alice", "abc.onion:4444",
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Contact { command: ContactCommands::Add { .. } })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "contact", "list"]).unwrap().command,
+            Some(Commands::Contact { command: ContactCommands::List })
+        ));
     }
 }
