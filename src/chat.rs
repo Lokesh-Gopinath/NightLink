@@ -230,6 +230,25 @@ pub(crate) fn bg_print(msg: &str) {
     let _ = io::stdout().flush();
 }
 
+/// Like [`bg_print`], but only clears the current line and prints the message;
+/// it does **not** redraw the shell prompt. Use this when the printed message
+/// changes the chat state (e.g. a chat was accepted or closed), because the
+/// shell's polling loop redraws the correct prompt itself after the
+/// transition.
+pub(crate) fn bg_notice(msg: &str) {
+    let prompt = crate::types::LAST_PROMPT
+        .lock()
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
+
+    if prompt {
+        print!("\x1B[2K\r{}\n", msg);
+    } else {
+        println!("{}", msg);
+    }
+    let _ = io::stdout().flush();
+}
+
 // ============================ listener / incoming ============================
 
 /// Bind the listener on the hidden-service port and accept CONNECT requests.
@@ -431,7 +450,7 @@ async fn watch_ping_response(
                     &static_secret,
                     &their_static,
                 );
-                begin_session(
+                let started = begin_session(
                     state.clone(),
                     stream,
                     peer_nl_id.clone(),
@@ -440,11 +459,20 @@ async fn watch_ping_response(
                     their_static,
                 )
                 .await;
+                if started {
+                    // Point LAST_PROMPT at the chat prompt so the acceptance notice
+                    // (and the shell's transition poll) redraw the *chat* prompt,
+                    // not the old main prompt. This makes the pinger land directly
+                    // in chat mode without an extra Enter.
+                    if let Ok(mut lp) = crate::types::LAST_PROMPT.lock() {
+                        *lp = format!("[nite~{}]: ", peer_alias);
+                    }
+                    bg_print(&format!(
+                        "[nite] {} accepted your connection. Now chatting (encrypted) with {}. Use /exit or /back to leave.",
+                        peer_alias, peer_alias
+                    ));
+                }
                 remove_pending(state, &peer_nl_id).await;
-                bg_print(&format!(
-                    "[nite] {} accepted your connection. Now chatting (encrypted) with {}. Use /exit or /back to leave.",
-                    peer_alias, peer_alias
-                ));
             } else if text.starts_with("REJECT") {
                 bg_print(&format!("[nite] {} rejected your connection request.", peer_alias));
                 remove_pending(state, &peer_nl_id).await;
@@ -604,6 +632,9 @@ pub async fn reject_pending(state: Arc<Mutex<AppState>>, target: &str) -> Result
 
 /// Turn a live stream into an encrypted session: split it, store the write
 /// half and cipher, and spawn a background reader for incoming frames.
+/// Returns `true` when the session was actually installed (i.e. no chat was
+/// already active), `false` when the chat was rejected because another
+/// session already owns the state.
 async fn begin_session(
     state: Arc<Mutex<AppState>>,
     stream: TcpStream,
@@ -611,7 +642,7 @@ async fn begin_session(
     peer_alias: String,
     cipher: chacha20poly1305::ChaCha20Poly1305,
     peer_static_public: PublicKey,
-) {
+) -> bool {
     let (read_half, write_half) = stream.into_split();
     let session = ChatSession {
         peer_nl_id: peer_nl_id.clone(),
@@ -624,11 +655,12 @@ async fn begin_session(
         let mut guard = state.lock().await;
         if guard.current_chat.is_some() {
             bg_print(&format!("[nite] {} connected, but you are already in a chat.", peer_alias));
-            return; // halves dropped => connection closed
+            return false; // halves dropped => connection closed
         }
         guard.current_chat = Some(session);
     }
     spawn_message_reader(state, read_half, peer_nl_id, peer_alias, cipher);
+    true
 }
 
 /// Send one encrypted chat message on the active session.
@@ -712,9 +744,9 @@ fn spawn_message_reader(
         if clear {
             guard.current_chat = None;
             if peer_left {
-                bg_print(&format!("[nite] {} left the chat. Returned to main prompt.", peer_alias));
+                bg_notice(&format!("[nite] {} left the chat. Returned to main prompt.", peer_alias));
             } else {
-                bg_print(&format!("[nite] Connection with {} closed. Returned to main prompt.", peer_alias));
+                bg_notice(&format!("[nite] Connection with {} closed. Returned to main prompt.", peer_alias));
             }
         }
     });
