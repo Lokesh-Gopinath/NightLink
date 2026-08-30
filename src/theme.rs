@@ -8,6 +8,10 @@ pub const LOGO: &str = r#" __   __     __     ______     __  __     ______      
  \ \_\\"\_\  \ \_\  \ \_____\  \ \_\ \_\    \ \_\     \ \_____\  \ \_\  \ \_\\"\_\  \ \_\ \_\ 
   \/_/ \/_/   \/_/   \/_____/   \/_/\/_/     \/_/      \/_____/   \/_/   \/_/ \/_/   \/_/\/_/"#;
 
+/// Dracula palette used to render the ASCII-art logo on every theme, so the
+/// banner always matches the brand regardless of the selected theme.
+const DRACULA_ASCII: &str = "\x1B[38;2;255;121;198m"; // Soft pink #FF79C6
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Theme {
     Default,
@@ -89,14 +93,42 @@ impl Theme {
         }
     }
 
+    /// Render the ASCII-art logo. The logo always uses the Dracula brand
+    /// palette (pink on the theme background), independent of the selected
+    /// theme — only the rest of the UI follows the theme colors.
     pub fn ascii_art(&self) -> String {
-        let art = LOGO;
-        match self {
-            Theme::Default => art.to_string(),
-            Theme::Matrix => format!("\x1B[32m{}\x1B[0m", art), // Green
-            Theme::Nord => format!("\x1B[38;2;136;192;208m{}\x1B[0m", art), // Nord4
-            Theme::Dracula => format!("\x1B[38;2;189;147;249m{}\x1B[0m", art), // Purple
-            Theme::Mist => format!("\x1B[38;2;175;222;227m{}\x1B[0m", art), // Primary #AFDEE3
+        format!("{}{}\x1B[0m", DRACULA_ASCII, LOGO)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_art_always_uses_dracula_palette() {
+        // The banner must look identical regardless of the selected theme.
+        let reference = Theme::Dracula.ascii_art();
+        for theme in [Theme::Default, Theme::Matrix, Theme::Nord, Theme::Mist, Theme::Dracula] {
+            assert_eq!(theme.ascii_art(), reference, "ascii art must not depend on the theme");
+        }
+        // And it must be the Dracula pink SGR color.
+        assert!(reference.contains("255;121;198"), "Dracula pink missing from banner");
+        assert!(reference.contains(LOGO), "banner must contain the logo");
+    }
+
+    #[test]
+    fn theme_round_trip_by_name() {
+        // Every theme that `theme <name>` accepts must exist.
+        for name in ["default", "matrix", "nord", "dracula", "mist"] {
+            match name {
+                "default" => assert!(matches!(Theme::Default, Theme::Default)),
+                "matrix" => assert!(matches!(Theme::Matrix, Theme::Matrix)),
+                "nord" => assert!(matches!(Theme::Nord, Theme::Nord)),
+                "dracula" => assert!(matches!(Theme::Dracula, Theme::Dracula)),
+                "mist" => assert!(matches!(Theme::Mist, Theme::Mist)),
+                _ => unreachable!(),
+            }
         }
     }
 }
