@@ -57,6 +57,7 @@ jobs:
           files: NightLink-v*.zip
           generate_release_notes: true
           tag_name: ${{ github.ref_name }}
-          name: NightLink ${{ github.ref_name }}
+          # Note: no `name:` here — the release keeps whatever title the
+          # maintainer set when creating it (e.g. a descriptive feature title).
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
