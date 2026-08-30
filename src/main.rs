@@ -195,8 +195,60 @@ enum ContactCommands {
     List,
 }
 
+/// Apply the embedded app icon to the console window so the icon appears in
+/// the taskbar and Alt+Tab while nite is running (Explorer and file
+/// properties pick the icon up from the exe resource on their own).
+#[cfg(windows)]
+fn apply_console_window_icon() {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, LoadIconW, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+        LR_SHARED, SM_CXSMICON, SM_CYSMICON, WM_SETICON,
+    };
+    type Pc = windows_sys::core::PCWSTR;
+
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if hwnd == 0 {
+            return; // no console window attached (e.g. output redirected)
+        }
+        let hmod = GetModuleHandleW(std::ptr::null());
+        if hmod == 0 {
+            return;
+        }
+        // winres embeds the icon as resource ID 1 (`1 ICON "assets/logo/NL.ico"`).
+        let id: Pc = 1 as Pc;
+
+        // Big icon (32x32): taskbar + Alt+Tab.
+        let big = LoadIconW(hmod, id);
+        if big != 0 {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as isize);
+        }
+        // Small icon (16x16): title bar corner / small taskbar buttons.
+        let small = LoadImageW(
+            hmod,
+            id,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_SHARED,
+        );
+        if small != 0 {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
+        }
+    }
+}
+
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+fn apply_console_window_icon() {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Show the embedded NL.ico in the taskbar / Alt+Tab while nite runs.
+    apply_console_window_icon();
+
     std::panic::set_hook(Box::new(|panic_info| {
         eprintln!("\n[nite] FATAL ERROR: {}", panic_info);
         pause_and_exit(1);
