@@ -217,23 +217,27 @@ fn apply_console_window_icon() {
         if hmod == 0 {
             return;
         }
-        // winres embeds the icon as resource ID 1 (`1 ICON "assets/logo/NL.ico"`).
-        let id: Pc = 1 as Pc;
+        // The icon is embedded either as the named resource `IDI_ICON1`
+        // (nite.rc + rc.exe path) or as numeric ID 1 (winres fallback).
+        let name: Vec<u16> = "IDI_ICON1\0".encode_utf16().collect();
+        let by_name: Pc = name.as_ptr();
+        let by_id: Pc = 1 as Pc;
 
         // Big icon (32x32): taskbar + Alt+Tab.
-        let big = LoadIconW(hmod, id);
+        let mut big = LoadIconW(hmod, by_name);
+        if big == 0 {
+            big = LoadIconW(hmod, by_id);
+        }
         if big != 0 {
             SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as isize);
         }
         // Small icon (16x16): title bar corner / small taskbar buttons.
-        let small = LoadImageW(
-            hmod,
-            id,
-            IMAGE_ICON,
-            GetSystemMetrics(SM_CXSMICON),
-            GetSystemMetrics(SM_CYSMICON),
-            LR_SHARED,
-        );
+        let cx = GetSystemMetrics(SM_CXSMICON);
+        let cy = GetSystemMetrics(SM_CYSMICON);
+        let mut small = LoadImageW(hmod, by_name, IMAGE_ICON, cx, cy, LR_SHARED);
+        if small == 0 {
+            small = LoadImageW(hmod, by_id, IMAGE_ICON, cx, cy, LR_SHARED);
+        }
         if small != 0 {
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
         }
