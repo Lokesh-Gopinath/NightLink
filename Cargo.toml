@@ -1,6 +1,6 @@
 [package]
 name = "nite"
-version = "2.0.5"
+version = "2.0.6"
 edition = "2021"
 description = "Tor-only P2P encrypted chat"
 license = "GPL-3.0"
