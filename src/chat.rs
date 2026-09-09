@@ -18,6 +18,7 @@
 //! over the ephemeral and static key pairs (see `crypto`), so every `MSG`
 //! frame is encrypted end-to-end.
 
+use std::collections::HashMap;
 use std::io::{self, Write as StdIoWrite};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,8 +32,12 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::crypto;
+use crate::group;
 use crate::tor;
-use crate::types::{AppState, ChatSession, Config, Contact, IdentityKeys, PendingConnection};
+use crate::types::{
+    AppState, ActiveContext, ChatSession, Config, Contact, IdentityKeys, MAX_SESSIONS,
+    PendingConnection,
+};
 
 /// Local address the Tor hidden service forwards to.
 pub const LISTEN_ADDR: &str = "127.0.0.1:4444";
@@ -286,11 +291,9 @@ async fn handle_incoming_connection(
 
     {
         let mut guard = state.lock().await;
-        // One chat at a time and no duplicates.
-        if let Some(session) = &guard.current_chat {
-            if session.peer_nl_id == info.nl_id {
-                return Err(anyhow!("already chatting with {}", info.alias));
-            }
+        // No duplicate sessions with the same peer and no duplicate pendings.
+        if guard.sessions.contains_key(&info.nl_id) {
+            return Err(anyhow!("already chatting with {}", info.alias));
         }
         if guard
             .pending_connections
@@ -298,6 +301,12 @@ async fn handle_incoming_connection(
             .any(|p| p.peer_nl_id == info.nl_id)
         {
             return Err(anyhow!("duplicate connection from {}", info.alias));
+        }
+        // Group chats stack sessions; only refuse at the hard cap.
+        if guard.sessions.len() >= MAX_SESSIONS {
+            let reject = format!("REJECT {}", info.nl_id);
+            let _ = write_frame(&mut stream, reject.as_bytes()).await;
+            return Err(anyhow!("session limit reached; refused {}", info.alias));
         }
         guard.pending_connections.push(PendingConnection {
             peer_nl_id: info.nl_id.clone(),
@@ -346,6 +355,12 @@ pub async fn send_connection_request(
 
     {
         let mut guard = state.lock().await;
+        if guard.sessions.contains_key(&contact.nl_id) {
+            return Err(anyhow!("already connected to {}", contact.alias));
+        }
+        if guard.sessions.len() >= MAX_SESSIONS {
+            return Err(anyhow!("session limit reached ({})", MAX_SESSIONS));
+        }
         if guard
             .pending_connections
             .iter()
@@ -370,6 +385,11 @@ pub async fn send_connection_request(
     let alias = contact.alias.clone();
     let static_owned = identity.static_secret.clone();
     let stored_public_key = contact.public_key.clone();
+    let groups: HashMap<String, String> = config
+        .groups
+        .iter()
+        .map(|(id, g)| (id.clone(), g.display_name().to_string()))
+        .collect();
     tokio::spawn(watch_ping_response(
         state,
         nl_id,
@@ -377,6 +397,7 @@ pub async fn send_connection_request(
         stored_public_key,
         ephemeral_secret,
         static_owned,
+        groups,
     ));
     Ok(())
 }
@@ -390,6 +411,7 @@ async fn watch_ping_response(
     stored_public_key: Vec<u8>,
     ephemeral_secret: x25519_dalek::EphemeralSecret,
     static_secret: StaticSecret,
+    groups: HashMap<String, String>,
 ) {
     // The pending entry stays visible in `pending` while we wait; the stream
     // itself is taken out so reads do not block the state lock.
@@ -450,27 +472,35 @@ async fn watch_ping_response(
                     &static_secret,
                     &their_static,
                 );
-                let started = begin_session(
+                let (started, switched) = begin_session(
                     state.clone(),
                     stream,
                     peer_nl_id.clone(),
                     peer_alias.clone(),
                     cipher,
                     their_static,
+                    groups,
                 )
                 .await;
                 if started {
-                    // Point LAST_PROMPT at the chat prompt so the acceptance notice
-                    // (and the shell's transition poll) redraw the *chat* prompt,
-                    // not the old main prompt. This makes the pinger land directly
-                    // in chat mode without an extra Enter.
-                    if let Ok(mut lp) = crate::types::LAST_PROMPT.lock() {
-                        *lp = format!("[nite~{}]: ", peer_alias);
+                    if switched {
+                        // Point LAST_PROMPT at the chat prompt so the acceptance notice
+                        // (and the shell's transition poll) redraw the *chat* prompt,
+                        // not the old main prompt. This makes the pinger land directly
+                        // in chat mode without an extra Enter.
+                        if let Ok(mut lp) = crate::types::LAST_PROMPT.lock() {
+                            *lp = format!("[nite~{}]: ", peer_alias);
+                        }
+                        bg_print(&format!(
+                            "[nite] {} accepted your connection. Now chatting (encrypted) with {}. Use /exit or /back to leave.",
+                            peer_alias, peer_alias
+                        ));
+                    } else {
+                        bg_print(&format!(
+                            "[nite] {} connected. Session is open; your messages still go to your current target ('ping {}' to switch).",
+                            peer_alias, peer_alias
+                        ));
                     }
-                    bg_print(&format!(
-                        "[nite] {} accepted your connection. Now chatting (encrypted) with {}. Use /exit or /back to leave.",
-                        peer_alias, peer_alias
-                    ));
                 }
                 remove_pending(state, &peer_nl_id).await;
             } else if text.starts_with("REJECT") {
@@ -501,8 +531,11 @@ pub async fn accept_pending(
 ) -> Result<()> {
     let pending = {
         let mut guard = state.lock().await;
-        if guard.current_chat.is_some() {
-            return Err(anyhow!("You are already in a chat. Use /exit or /back first."));
+        if guard.sessions.len() >= MAX_SESSIONS {
+            return Err(anyhow!(
+                "Session limit reached ({}) — cannot accept more connections.",
+                MAX_SESSIONS
+            ));
         }
         let idx = guard.pending_connections.iter().position(|p| {
             p.incoming
@@ -591,19 +624,34 @@ pub async fn accept_pending(
 
     let peer_nl_id = pending.peer_nl_id.clone();
     let peer_alias = pending.peer_alias.clone();
-    begin_session(
+    let groups: HashMap<String, String> = config
+        .groups
+        .iter()
+        .map(|(id, g)| (id.clone(), g.display_name().to_string()))
+        .collect();
+    let (installed, switched) = begin_session(
         state.clone(),
         stream,
         peer_nl_id,
         peer_alias.clone(),
         cipher,
         their_static,
+        groups,
     )
     .await;
-    println!(
-        "[nite] Accepted (verified) connection from {}. Now chatting (encrypted) with {}. Type your messages below. Use /exit or /back to leave.",
-        peer_alias, peer_alias
-    );
+    if installed {
+        if switched {
+            println!(
+                "[nite] Accepted (verified) connection from {}. Now chatting (encrypted) with {}. Type your messages below. Use /exit or /back to leave.",
+                peer_alias, peer_alias
+            );
+        } else {
+            println!(
+                "[nite] Accepted (verified) connection from {}. Session is open; your messages still go to your current target.",
+                peer_alias
+            );
+        }
+    }
     Ok(())
 }
 
@@ -631,10 +679,10 @@ pub async fn reject_pending(state: Arc<Mutex<AppState>>, target: &str) -> Result
 // ============================ chat session ============================
 
 /// Turn a live stream into an encrypted session: split it, store the write
-/// half and cipher, and spawn a background reader for incoming frames.
-/// Returns `true` when the session was actually installed (i.e. no chat was
-/// already active), `false` when the chat was rejected because another
-/// session already owns the state.
+/// half and cipher in the session map, and spawn a background reader for
+/// incoming frames. Returns `(installed, switched_context)` —
+/// `switched_context` is true when the new session became the active message
+/// target (i.e. there was no active context before).
 async fn begin_session(
     state: Arc<Mutex<AppState>>,
     stream: TcpStream,
@@ -642,7 +690,8 @@ async fn begin_session(
     peer_alias: String,
     cipher: chacha20poly1305::ChaCha20Poly1305,
     peer_static_public: PublicKey,
-) -> bool {
+    groups: HashMap<String, String>,
+) -> (bool, bool) {
     let (read_half, write_half) = stream.into_split();
     let session = ChatSession {
         peer_nl_id: peer_nl_id.clone(),
@@ -651,25 +700,35 @@ async fn begin_session(
         cipher: cipher.clone(),
         peer_static_public,
     };
+    let switched;
     {
         let mut guard = state.lock().await;
-        if guard.current_chat.is_some() {
-            bg_print(&format!("[nite] {} connected, but you are already in a chat.", peer_alias));
-            return false; // halves dropped => connection closed
+        if guard.sessions.contains_key(&peer_nl_id) {
+            bg_print(&format!(
+                "[nite] {} connected, but a session with them is already open.",
+                peer_alias
+            ));
+            return (false, false); // halves dropped => connection closed
         }
-        guard.current_chat = Some(session);
+        switched = matches!(guard.active, ActiveContext::None);
+        if switched {
+            guard.active = ActiveContext::Peer(peer_nl_id.clone());
+        }
+        guard.sessions.insert(peer_nl_id.clone(), session);
     }
-    spawn_message_reader(state, read_half, peer_nl_id, peer_alias, cipher);
-    true
+    spawn_message_reader(state, read_half, peer_nl_id, peer_alias, cipher, groups);
+    (true, switched)
 }
 
-/// Send one encrypted chat message on the active session.
-pub async fn send_message(state: Arc<Mutex<AppState>>, message: &str) -> Result<()> {
-    let guard = state.lock().await;
-    let session = guard
-        .current_chat
-        .as_ref()
-        .ok_or_else(|| anyhow!("Not currently in a chat"))?;
+/// Result of a send on the active context.
+pub struct DeliveryReport {
+    pub delivered: usize,
+    /// NL-IDs of members with no (or a broken) session.
+    pub failed: Vec<String>,
+}
+
+/// Encrypt `message` on `session` and write it as a MSG frame.
+async fn send_on_session(session: &ChatSession, message: &str) -> Result<()> {
     let encrypted = crypto::encrypt_message(&session.cipher, message.as_bytes())?;
     let mut write = session.write.lock().await;
     let frame = format!("MSG {}", hex::encode(&encrypted));
@@ -677,24 +736,103 @@ pub async fn send_message(state: Arc<Mutex<AppState>>, message: &str) -> Result<
     Ok(())
 }
 
-/// Leave the current chat, notifying the peer with a BYE frame.
-pub async fn leave_chat(state: Arc<Mutex<AppState>>) {
-    let alias = {
-        let guard = state.lock().await;
-        let Some(session) = guard.current_chat.as_ref() else {
-            println!("[nite] You are not in a chat.");
-            return;
-        };
-        let alias = session.peer_alias.clone();
-        let mut write = session.write.lock().await;
-        let _ = write_frame(&mut *write, b"BYE").await; // best effort
-        alias
-    };
-    {
-        let mut guard = state.lock().await;
-        guard.current_chat = None;
+/// Send `message` to the active context: a single peer, or fanned out (one
+/// individually encrypted message per member) to a group.
+pub async fn send_current(
+    state: Arc<Mutex<AppState>>,
+    config: &Config,
+    message: &str,
+) -> Result<DeliveryReport> {
+    let mut guard = state.lock().await;
+    match guard.active.clone() {
+        ActiveContext::Peer(peer_id) => {
+            let result = match guard.sessions.get(&peer_id) {
+                Some(session) => send_on_session(session, message).await,
+                None => return Err(anyhow!("Chat session has closed")),
+            };
+            match result {
+                Ok(()) => Ok(DeliveryReport {
+                    delivered: 1,
+                    failed: Vec::new(),
+                }),
+                Err(e) => {
+                    let was_active = guard.active == ActiveContext::Peer(peer_id.clone());
+                    guard.sessions.remove(&peer_id);
+                    if was_active {
+                        guard.active = ActiveContext::None;
+                    }
+                    Err(anyhow!("send failed (session closed): {}", e))
+                }
+            }
+        }
+        ActiveContext::Group(group_id) => {
+            let group = config
+                .groups
+                .get(&group_id)
+                .ok_or_else(|| anyhow!("Group {} no longer exists", group_id))?;
+            let frame = group::frame_message(&group_id, message);
+            let mut delivered = 0usize;
+            let mut failed = Vec::new();
+            for member in &group.members {
+                if member == &config.nl_id {
+                    continue; // never send to ourselves
+                }
+                let member_id = member.clone();
+                let result = match guard.sessions.get(&member_id) {
+                    Some(session) => send_on_session(session, &frame).await,
+                    None => {
+                        failed.push(member_id);
+                        continue;
+                    }
+                };
+                match result {
+                    Ok(()) => delivered += 1,
+                    Err(_) => {
+                        // Dead session: drop it so later messages skip it.
+                        guard.sessions.remove(&member_id);
+                        failed.push(member_id);
+                    }
+                }
+            }
+            Ok(DeliveryReport { delivered, failed })
+        }
+        ActiveContext::None => Err(anyhow!("Not in a chat or group")),
     }
-    println!("[nite] You have left the chat with {}.", alias);
+}
+
+/// What leaving the active context acted upon.
+pub enum Left {
+    /// Closed the encrypted session with this peer (alias returned).
+    Peer(String),
+    /// Exited a group view; open sessions keep running (group ID returned).
+    Group(String),
+}
+
+/// Leave the active context. A peer session is closed with a BYE frame and
+/// removed; a group view is exited while its sessions keep running.
+pub async fn leave_current(state: Arc<Mutex<AppState>>) -> Option<Left> {
+    let mut guard = state.lock().await;
+    match guard.active.clone() {
+        ActiveContext::Peer(peer_id) => {
+            let alias = guard
+                .sessions
+                .get(&peer_id)
+                .map(|s| s.peer_alias.clone())
+                .unwrap_or_else(|| peer_id.clone());
+            if let Some(session) = guard.sessions.get(&peer_id) {
+                let mut write = session.write.lock().await;
+                let _ = write_frame(&mut *write, b"BYE").await; // best effort
+            }
+            guard.sessions.remove(&peer_id);
+            guard.active = ActiveContext::None;
+            Some(Left::Peer(alias))
+        }
+        ActiveContext::Group(group_id) => {
+            guard.active = ActiveContext::None;
+            Some(Left::Group(group_id))
+        }
+        ActiveContext::None => None,
+    }
 }
 
 /// Background task: decrypt and print incoming MSG frames; clean up on BYE/EOF.
@@ -704,6 +842,7 @@ fn spawn_message_reader(
     peer_nl_id: String,
     peer_alias: String,
     cipher: chacha20poly1305::ChaCha20Poly1305,
+    groups: HashMap<String, String>,
 ) {
     tokio::spawn(async move {
         let mut peer_left = false;
@@ -723,7 +862,18 @@ fn spawn_message_reader(
                     .and_then(|blob| crypto::decrypt_message(&cipher, &blob).ok())
                     .and_then(|plaintext| String::from_utf8(plaintext).ok());
                 match decrypted {
-                    Some(message) => bg_print(&format!("[{}]: {}", peer_alias, message)),
+                    Some(message) => {
+                        // Group messages carry a [GRP:<id>] prefix for display.
+                        if let Some((group_id, content)) = group::parse_frame(&message) {
+                            let group_name = groups
+                                .get(&group_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or("Unknown Group");
+                            bg_print(&format!("[{}~{}]: {}", group_name, peer_alias, content));
+                        } else {
+                            bg_print(&format!("[{}]: {}", peer_alias, message));
+                        }
+                    }
                     None => bg_print(&format!(
                         "[nite] Could not decrypt a message from {} (key mismatch or tampering).",
                         peer_alias
@@ -734,20 +884,29 @@ fn spawn_message_reader(
             }
         }
 
-        // If this session is still the active one, clear it.
+        // Clean the session up; if it was the active target, return to main.
         let mut guard = state.lock().await;
-        let clear = guard
-            .current_chat
-            .as_ref()
-            .map(|s| s.peer_nl_id == peer_nl_id)
-            .unwrap_or(false);
-        if clear {
-            guard.current_chat = None;
+        guard.sessions.remove(&peer_nl_id);
+        let was_active = guard.active == ActiveContext::Peer(peer_nl_id.clone());
+        if was_active {
+            guard.active = ActiveContext::None;
+        }
+        if was_active {
             if peer_left {
-                bg_notice(&format!("[nite] {} left the chat. Returned to main prompt.", peer_alias));
+                bg_notice(&format!(
+                    "[nite] {} left the chat. Returned to main prompt.",
+                    peer_alias
+                ));
             } else {
-                bg_notice(&format!("[nite] Connection with {} closed. Returned to main prompt.", peer_alias));
+                bg_notice(&format!(
+                    "[nite] Connection with {} closed. Returned to main prompt.",
+                    peer_alias
+                ));
             }
+        } else if peer_left {
+            bg_notice(&format!("[nite] {} left the chat.", peer_alias));
+        } else {
+            bg_notice(&format!("[nite] Connection with {} closed.", peer_alias));
         }
     });
 }

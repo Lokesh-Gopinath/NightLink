@@ -8,6 +8,7 @@ use ed25519_dalek::SigningKey;
 mod types;
 mod config;
 mod crypto;
+mod group;
 mod theme;
 mod tor;
 mod chat;
@@ -168,6 +169,12 @@ enum Commands {
     Pending,
     Accept { alias: String },
     Reject { alias: String },
+    /// Group chat commands
+    #[command(alias = "g")]
+    Group {
+        #[command(subcommand)]
+        command: GroupCommands,
+    },
     /// Change your display name
     #[command(name = "set-display-name", alias = "set-name")]
     SetDisplayName {
@@ -177,6 +184,37 @@ enum Commands {
     Theme { name: String },
     Help,
     Exit,
+}
+
+#[derive(Subcommand)]
+enum GroupCommands {
+    /// Create a new group (you become the first member)
+    #[command(alias = "c")]
+    Create {
+        /// Group name (1-64 chars: letters, numbers, spaces, hyphens, underscores)
+        name: String,
+    },
+    /// Join a group by ID (optionally set its local display name)
+    #[command(alias = "j")]
+    Join {
+        group_id: String,
+        /// Optional display name for the group (local only)
+        name: Option<String>,
+    },
+    /// Leave a group
+    #[command(alias = "l")]
+    Leave { group_id: String },
+    /// Add a contact to a group (your messages fan out to group members)
+    #[command(alias = "a")]
+    Add { group_id: String, member: String },
+    /// List all groups
+    #[command(alias = "ls")]
+    List,
+    /// List the members of a group
+    #[command(alias = "m")]
+    Members { group_id: String },
+    /// Enter a group so typed messages go to all of its members
+    Chat { group_id: String },
 }
 
 #[derive(Subcommand)]
@@ -411,27 +449,36 @@ async fn start_shell(
         }
     });
 
-    // Whether the UI currently shows a chat prompt (for transition redraws).
-    let mut in_chat = false;
+    // Whether the UI currently shows a chat/group prompt (for transition redraws).
+    let mut in_special = false;
     // Whether the current prompt line is already on screen.
     let mut prompt_drawn = false;
 
     loop {
-        // Current chat partner (None = main prompt).
-        let chat_with = {
+        // Current message target: Some(label) = peer alias or group name.
+        let context_label = {
             let state_guard = state.lock().await;
-            state_guard
-                .current_chat
-                .as_ref()
-                .map(|session| session.peer_alias.clone())
+            match &state_guard.active {
+                types::ActiveContext::Peer(id) => {
+                    state_guard.sessions.get(id).map(|s| s.peer_alias.clone())
+                }
+                types::ActiveContext::Group(gid) => Some(
+                    config
+                        .groups
+                        .get(gid)
+                        .map(|g| g.display_name().to_string())
+                        .unwrap_or_else(|| gid.clone()),
+                ),
+                types::ActiveContext::None => None,
+            }
         };
-        let now_in_chat = chat_with.is_some();
+        let now_in_special = context_label.is_some();
 
         // ---- draw / re-draw the right prompt when the state changed ----
-        if now_in_chat != in_chat {
-            in_chat = now_in_chat;
-            if let Some(alias) = &chat_with {
-                let p = format!("[nite~{}]: ", alias);
+        if now_in_special != in_special {
+            in_special = now_in_special;
+            if let Some(label) = &context_label {
+                let p = format!("[nite~{}]: ", label);
                 // If a background task already drew the chat prompt (and
                 // bumped LAST_PROMPT), don't print a second one.
                 let already = types::LAST_PROMPT.lock().map(|lp| *lp == p).unwrap_or(false);
@@ -453,8 +500,8 @@ async fn start_shell(
                 prompt_drawn = true;
             }
         } else if !prompt_drawn {
-            let p = if let Some(alias) = &chat_with {
-                format!("[nite~{}]: ", alias)
+            let p = if let Some(label) = &context_label {
+                format!("[nite~{}]: ", label)
             } else {
                 config.theme.prompt()
             };
@@ -482,18 +529,60 @@ async fn start_shell(
             continue;
         }
 
-        // Check for chat exit commands
+        // Check for chat/group exit commands
         if input == "/exit" || input == "/back" {
-            chat::leave_chat(state.clone()).await;
+            match chat::leave_current(state.clone()).await {
+                Some(chat::Left::Peer(alias)) => {
+                    println!("[nite] You have left the chat with {}.", alias);
+                }
+                Some(chat::Left::Group(group_id)) => {
+                    let name = config
+                        .groups
+                        .get(&group_id)
+                        .map(|g| g.display_name().to_string())
+                        .unwrap_or_else(|| group_id.clone());
+                    println!(
+                        "[nite] Left group {}. Open sessions keep running — use 'ping <alias>' or 'group chat <id>' to switch back.",
+                        name
+                    );
+                }
+                None => println!("[nite] You are not in a chat or group."),
+            }
             continue;
         }
 
-        // If in chat mode, send the input as a network message
-        if now_in_chat {
-            if let Err(e) = chat::send_message(state.clone(), &input).await {
-                println!("{}", config.theme.error(&format!("Failed to send: {}. Connection may be lost.", e)));
-                let mut state_guard = state.lock().await;
-                state_guard.current_chat = None;
+        // If a chat/group is active, send the input as a network message
+        if now_in_special {
+            match chat::send_current(state.clone(), &config, &input).await {
+                Ok(report) => {
+                    if !report.failed.is_empty() {
+                        let names: Vec<String> = report
+                            .failed
+                            .iter()
+                            .map(|id| {
+                                config
+                                    .contacts
+                                    .get(id)
+                                    .map(|c| c.alias.clone())
+                                    .unwrap_or_else(|| id.clone())
+                            })
+                            .collect();
+                        println!(
+                            "{}",
+                            config.theme.log(&format!(
+                                "Delivered to {} member(s). No open session with: {} (ping them first).",
+                                report.delivered,
+                                names.join(", ")
+                            ))
+                        );
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "{}",
+                        config.theme.error(&format!("Failed to send: {}", e))
+                    );
+                }
             }
             continue;
         }
@@ -503,7 +592,7 @@ async fn start_shell(
         let cli = match Cli::try_parse_from(args) {
             Ok(cli) => cli,
             Err(e) => {
-                let suggestions = ["init", "fingerprint", "contact add", "contact list", "ping", "pending", "accept", "reject", "help", "exit"];
+                let suggestions = ["init", "fingerprint", "contact add", "contact list", "ping", "pending", "accept", "reject", "group", "help", "exit"];
                 if let Some(suggestion) = get_suggestion(&input, &suggestions) {
                     println!("{}", config.theme.error(&format!("Unknown command. Did you mean '{}'?", suggestion)));
                 } else {
@@ -777,18 +866,6 @@ async fn start_shell(
             }
 
             Some(Commands::Ping { target }) => {
-                // Check if already in a chat
-                {
-                    let state_guard = state.lock().await;
-                    if let Some(session) = &state_guard.current_chat {
-                        println!("{}", config.theme.log(&format!(
-                            "{} wants to connect (currently chatting with {}). Leave that chat first.",
-                            target, session.peer_alias
-                        )));
-                        continue;
-                    }
-                }
-
                 // Check if trying to ping self
                 if target == config.nl_id || target.to_uppercase() == config.nl_id {
                     println!("{}", config.theme.error("Cannot chat with yourself."));
@@ -800,22 +877,42 @@ async fn start_shell(
                     c.alias.eq_ignore_ascii_case(&target) || c.nl_id.eq_ignore_ascii_case(&target)
                 );
 
-                match contact {
-                    Some(contact) => {
-                        println!("{}", config.theme.log(&format!("Connecting to {}...", contact.alias)));
-                        match chat::send_connection_request(state.clone(), &config, contact, &identity).await {
-                            Ok(()) => println!("{}", config.theme.log(&format!(
-                                "Connection request sent to {}. Waiting for acceptance (see 'pending').",
-                                contact.alias
-                            ))),
-                            Err(e) => println!("{}", config.theme.error(&format!(
-                                "Could not connect to {}: {}", contact.alias, e
-                            ))),
-                        }
+                let Some(contact) = contact else {
+                    println!("{}", config.theme.error(&format!("Unknown contact or NL-ID: {}", target)));
+                    continue;
+                };
+
+                // Reuse an open session (just switch to it) or enforce the cap.
+                {
+                    let mut state_guard = state.lock().await;
+                    if state_guard.sessions.contains_key(&contact.nl_id) {
+                        state_guard.active = types::ActiveContext::Peer(contact.nl_id.clone());
+                        drop(state_guard);
+                        println!("{}", config.theme.log(&format!(
+                            "Already connected to {} — switched to that chat.",
+                            contact.alias
+                        )));
+                        continue;
                     }
-                    None => {
-                        println!("{}", config.theme.error(&format!("Unknown contact or NL-ID: {}", target)));
+                    if state_guard.sessions.len() >= types::MAX_SESSIONS {
+                        drop(state_guard);
+                        println!("{}", config.theme.error(&format!(
+                            "Session limit reached ({}). Leave a chat with /exit first.",
+                            types::MAX_SESSIONS
+                        )));
+                        continue;
                     }
+                }
+
+                println!("{}", config.theme.log(&format!("Connecting to {}...", contact.alias)));
+                match chat::send_connection_request(state.clone(), &config, contact, &identity).await {
+                    Ok(()) => println!("{}", config.theme.log(&format!(
+                        "Connection request sent to {}. Waiting for acceptance (see 'pending').",
+                        contact.alias
+                    ))),
+                    Err(e) => println!("{}", config.theme.error(&format!(
+                        "Could not connect to {}: {}", contact.alias, e
+                    ))),
                 }
             }
 
@@ -848,6 +945,173 @@ async fn start_shell(
                 }
             }
 
+            Some(Commands::Group { command }) => match command {
+                GroupCommands::Create { name } => {
+                    let self_id = config.nl_id.clone();
+                    match group::create(&mut config, &name, &self_id) {
+                        Ok(group) => {
+                            config::save(&config)?;
+                            println!(
+                                "{}",
+                                config.theme.log(&format!(
+                                    "Group created: {} ({}). Share this ID with others to join, then 'group add {} <alias>' for each member.",
+                                    group.display_name(),
+                                    group.id,
+                                    group.id
+                                ))
+                            );
+                        }
+                        Err(e) => println!("{}", config.theme.error(&format!("{}", e))),
+                    }
+                }
+                GroupCommands::Join { group_id, name } => {
+                    let self_id = config.nl_id.clone();
+                    match group::join(&mut config, &group_id, name.as_deref(), &self_id) {
+                        Ok(display) => {
+                            config::save(&config)?;
+                            println!(
+                                "{}",
+                                config.theme.log(&format!(
+                                    "Joined group {}. Use 'group chat {}' to send messages to its members.",
+                                    display, group_id
+                                ))
+                            );
+                        }
+                        Err(e) => println!("{}", config.theme.error(&format!("{}", e))),
+                    }
+                }
+                GroupCommands::Leave { group_id } => {
+                    let self_id = config.nl_id.clone();
+                    let active_before = state.lock().await.active.clone();
+                    let was_active = active_before == types::ActiveContext::Group(group_id.clone());
+                    match group::leave(&mut config, &group_id, &self_id) {
+                        Ok(removed_group) => {
+                            config::save(&config)?;
+                            if was_active {
+                                state.lock().await.active = types::ActiveContext::None;
+                            }
+                            if removed_group {
+                                println!(
+                                    "{}",
+                                    config.theme.log(&format!(
+                                        "Left group {}. It had no members left and was removed.",
+                                        group_id
+                                    ))
+                                );
+                            } else {
+                                println!(
+                                    "{}",
+                                    config.theme.log(&format!("Left group {}.", group_id))
+                                );
+                            }
+                        }
+                        Err(e) => println!("{}", config.theme.error(&format!("{}", e))),
+                    }
+                }
+                GroupCommands::Add { group_id, member } => {
+                    let Some(member_id) = config
+                        .contacts
+                        .values()
+                        .find(|c| {
+                            c.alias.eq_ignore_ascii_case(&member)
+                                || c.nl_id.eq_ignore_ascii_case(&member)
+                        })
+                        .map(|c| c.nl_id.clone())
+                    else {
+                        println!(
+                            "{}",
+                            config.theme.error(&format!("Unknown contact or NL-ID: {}", member))
+                        );
+                        continue;
+                    };
+                    if member_id == config.nl_id {
+                        println!(
+                            "{}",
+                            config.theme.error("You are always a member of your own groups.")
+                        );
+                        continue;
+                    }
+                    match group::add_member(&mut config, &group_id, &member_id) {
+                        Ok(()) => {
+                            config::save(&config)?;
+                            let alias = config
+                                .contacts
+                                .get(&member_id)
+                                .map(|c| c.alias.clone())
+                                .unwrap_or_else(|| member_id.clone());
+                            println!(
+                                "{}",
+                                config.theme.log(&format!("{} added to group {}.", alias, group_id))
+                            );
+                        }
+                        Err(e) => println!("{}", config.theme.error(&format!("{}", e))),
+                    }
+                }
+                GroupCommands::List => {
+                    if config.groups.is_empty() {
+                        println!("{}", config.theme.log("No groups"));
+                    } else {
+                        println!("{}", config.theme.log("Groups:"));
+                        let mut ids: Vec<&String> = config.groups.keys().collect();
+                        ids.sort();
+                        for id in ids {
+                            let group = &config.groups[id];
+                            println!(
+                                "{}",
+                                config.theme.log(&format!(
+                                    "  {} — {} ({} member{})",
+                                    id,
+                                    group.display_name(),
+                                    group.members.len(),
+                                    if group.members.len() == 1 { "" } else { "s" }
+                                ))
+                            );
+                        }
+                    }
+                }
+                GroupCommands::Members { group_id } => match config.groups.get(&group_id) {
+                    Some(group) => {
+                        println!(
+                            "{}",
+                            config.theme.log(&format!("Members of {}:", group.display_name()))
+                        );
+                        let mut members: Vec<&String> = group.members.iter().collect();
+                        members.sort();
+                        for member in members {
+                            let label = if *member == config.nl_id {
+                                format!("{} (you)", config.display_name)
+                            } else {
+                                match config.contacts.get(member) {
+                                    Some(c) => format!("{} ({})", c.alias, member),
+                                    None => format!("{} (no contact)", member),
+                                }
+                            };
+                            println!("{}", config.theme.log(&format!("  {}", label)));
+                        }
+                    }
+                    None => println!(
+                        "{}",
+                        config.theme.error(&format!("Group {} not found", group_id))
+                    ),
+                },
+                GroupCommands::Chat { group_id } => match config.groups.get(&group_id) {
+                    Some(group) => {
+                        let name = group.display_name().to_string();
+                        state.lock().await.active = types::ActiveContext::Group(group_id.clone());
+                        println!(
+                            "{}",
+                            config.theme.log(&format!(
+                                "Now in group {}. Typed messages go to every member with an open session. Use /exit or /back to leave the view.",
+                                name
+                            ))
+                        );
+                    }
+                    None => println!(
+                        "{}",
+                        config.theme.error(&format!("Group {} not found", group_id))
+                    ),
+                },
+            },
                         Some(Commands::SetDisplayName { name }) => {
                 match validate_display_name(&name) {
                     Ok(()) => {
@@ -900,7 +1164,15 @@ async fn start_shell(
                 println!("  {} - Show this help", "\x1B[37mhelp\x1B[0m");
                 println!("  {} - Quit", "\x1B[37mexit\x1B[0m");
                 println!("\n{}", config.theme.log("Chat Commands:"));
-                println!("  {} - Leave current chat", "\x1B[37m/exit or /back\x1B[0m");
+                println!("  {} - Leave current chat or group view", "\x1B[37m/exit or /back\x1B[0m");
+                println!("\n{}", config.theme.log("Group Commands:"));
+                println!("  {} <name> - Create a group", "\x1B[37mgroup create\x1B[0m");
+                println!("  {} <id> [name] - Join a group", "\x1B[37mgroup join\x1B[0m");
+                println!("  {} <id> <alias> - Add a contact to a group", "\x1B[37mgroup add\x1B[0m");
+                println!("  {} <id> - Enter a group (typed messages go to all members)", "\x1B[37mgroup chat\x1B[0m");
+                println!("  {} - List groups", "\x1B[37mgroup list\x1B[0m");
+                println!("  {} <id> - List group members", "\x1B[37mgroup members\x1B[0m");
+                println!("  {} <id> - Leave a group", "\x1B[37mgroup leave\x1B[0m");
             }
 
             Some(Commands::Exit) => {
@@ -981,6 +1253,54 @@ mod cli_parse_tests {
         assert!(matches!(
             Cli::try_parse_from(["nite", "contact", "list"]).unwrap().command,
             Some(Commands::Contact { command: ContactCommands::List })
+        ));
+    }
+
+    #[test]
+    fn parses_group_command_variants() {
+        use super::GroupCommands;
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "group", "create", "My Group"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::Create { .. } })
+        ));
+        // alias: g create
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "g", "c", "My Group"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::Create { .. } })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "group", "join", "NL-GRP-AAAA1234567890AB"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::Join { .. } })
+        ));
+        // alias: g j
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "g", "j", "NL-GRP-AAAA1234567890AB"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::Join { .. } })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "group", "leave", "NL-GRP-AAAA1234567890AB"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::Leave { .. } })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "group", "list"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::List })
+        ));
+        // alias: g ls
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "g", "ls"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::List })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "group", "members", "NL-GRP-AAAA1234567890AB"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::Members { .. } })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "group", "add", "NL-GRP-AAAA1234567890AB", "alice"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::Add { .. } })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["nite", "group", "chat", "NL-GRP-AAAA1234567890AB"]).unwrap().command,
+            Some(Commands::Group { command: GroupCommands::Chat { .. } })
         ));
     }
 }

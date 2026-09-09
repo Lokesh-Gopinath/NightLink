@@ -181,6 +181,7 @@ pub fn initialize() -> Result<Config, Error> {
         public_key: verifying_key.to_bytes().to_vec(),
         tor_address: None,
         contacts: HashMap::new(),
+        groups: HashMap::new(),
         theme: Theme::default(),
     };
 
@@ -206,6 +207,7 @@ pub fn initialize_silent() -> Result<(Config, String), Error> {
         public_key: verifying_key.to_bytes().to_vec(),
         tor_address: None,
         contacts: HashMap::new(),
+        groups: HashMap::new(),
         theme: Theme::default(),
     };
 
@@ -270,6 +272,7 @@ pub fn load() -> Result<Config, Error> {
             public_key: legacy.public_key,
             tor_address: legacy.tor_address,
             contacts,
+            groups: HashMap::new(),
             theme: Theme::default(),
         };
 
@@ -359,6 +362,7 @@ mod tests {
             public_key: vec![0u8; 32],
             tor_address: None,
             contacts: HashMap::new(),
+            groups: HashMap::new(),
             theme: Theme::default(),
         }
     }

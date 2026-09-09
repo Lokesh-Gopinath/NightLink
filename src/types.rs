@@ -19,6 +19,7 @@ pub static LAST_PROMPT: std::sync::Mutex<String> = std::sync::Mutex::new(String:
 pub type NLID = String;
 pub type Error = anyhow::Error;
 
+use crate::group::Group;
 use crate::theme::Theme;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -29,6 +30,9 @@ pub struct Config {
     pub public_key: Vec<u8>,
     pub tor_address: Option<String>,
     pub contacts: HashMap<NLID, Contact>,
+    /// Group chats: group ID -> group definition.
+    #[serde(default)]
+    pub groups: HashMap<String, Group>,
     #[serde(default = "Theme::default")]
     pub theme: Theme,
 }
@@ -95,9 +99,28 @@ pub struct IdentityKeys {
     pub static_public: PublicKey,
 }
 
+/// Maximum simultaneous encrypted sessions (a group chat keeps one per
+/// member).
+pub const MAX_SESSIONS: usize = 50;
+
+/// Where typed shell messages currently go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveContext {
+    /// Main prompt — typed input is parsed as a command.
+    None,
+    /// Typing sends an encrypted message to this peer.
+    Peer(NLID),
+    /// Typing fans the message out to every member of this group.
+    Group(String),
+}
+
 #[derive(Debug)]
 pub struct AppState {
-    pub current_chat: Option<ChatSession>,          // Active chat session
+    /// Open encrypted sessions, keyed by peer NL-ID (a group chat keeps one
+    /// per member).
+    pub sessions: HashMap<String, ChatSession>,
+    /// Where the user's typed input currently goes.
+    pub active: ActiveContext,
     pub pending_connections: Vec<PendingConnection>, // Pending connection requests
     pub is_tor_ready: bool,
 }
@@ -105,7 +128,8 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         Self {
-            current_chat: None,
+            sessions: HashMap::new(),
+            active: ActiveContext::None,
             pending_connections: Vec::new(),
             is_tor_ready: false,
         }
